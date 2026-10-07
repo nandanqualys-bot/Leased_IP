@@ -272,7 +272,7 @@ def host_in_scope(host, domain):
     d=domain.lower().rstrip(".")
     return host==d or host.endswith("."+d)
 
-def process_target(target, client, cache, cfg):
+def process_target(target, client, cache, cfg, include_known=False):
     parent=target["parent_organization"]; entity=target["target_entity"]
     known_asns={x.upper() for x in target.get("known_asns",[])}
     candidates={}
@@ -314,7 +314,7 @@ def process_target(target, client, cache, cfg):
         asns=ni.get("asns") or []
         origin_asn="AS"+str(asns[0]).replace("AS","") if asns else ""
         in_known=origin_asn.upper() in known_asns if origin_asn else False
-        if in_known: continue
+        if in_known and not include_known: continue
         # Discovery is intentionally lightweight. Detailed RDAP, Shodan and TLS
         # attribution is deferred to 04_ip_verification.py to avoid duplicating
         # expensive network calls for candidates that will later be rejected.
@@ -351,7 +351,7 @@ def process_target(target, client, cache, cfg):
             "Shodan_Hostnames":";".join(sh_hostnames) if sh_hostnames else "Not Available",
             "Shodan_Ports":",".join(map(str,ports)) if ports else "Not Available",
             "First_Seen":first,"Last_Seen":last,
-            "In_Known_ASN":False,"Off_ASN_Candidate":True,
+            "In_Known_ASN":in_known,"Off_ASN_Candidate":not in_known,
             "Discovery_Evidence":json.dumps({
                 "dns":meta.get("dns_records",[]),"tls":tls,
                 "rdap_org":rd_org,"origin_asn":origin_asn,

@@ -1,4 +1,12 @@
-# EASM Off-ASN Discovery and Verification System
+# Atlas EASM desktop application
+
+Launch the local PySide6 interface with `python main.py` after installing
+`requirements.txt`. Enter or import targets, watch analysis progress, inspect
+evidence and prior runs, then export results when needed. See
+[desktop installation and workflow](#atlas-easm-desktop-application) below.
+
+The command-line tools described in the following sections remain available
+for scripted and legacy workflows.
 
 This project implements the requested four-stage defensive EASM workflow:
 
@@ -389,3 +397,43 @@ This version is intentionally high-precision for EASM attribution:
 ### Optional Censys configuration
 
 Set `CENSYS_API_TOKEN` and `CENSYS_ORG_ID` in `.env`, or put them in `config.json`. `CENSYS_HISTORY_DAYS` defaults to 31. If credentials are absent, the system continues without historical DNS and explicitly reports it as unavailable.
+
+---
+
+## Atlas EASM desktop application
+
+The primary interface is now a local PySide6 desktop application. The existing command-line scripts remain available for compatibility. The desktop app calls their discovery and verification functions directly; it does not start a web server or shell subprocess for analysis.
+
+### Install and launch on Windows
+
+Install Python 3.12 or newer, then in this repository:
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python main.py
+```
+
+On Linux/macOS, activate `.venv/bin/activate` and use `python main.py`. A graphical desktop session is required. No administrator rights are needed for normal use.
+
+### Workflow
+
+Open **New Analysis**. Enter a parent organization, target entity, domain, known ASN and optional registrant names, or import an `.xlsx` target file. Multiple values use semicolons. Both paths use the same target validator and canonical ASN normalizer. Review the target list, then click **Run analysis**. Discovery and verification run in a Qt worker thread, so the window remains responsive. Cancellation stops at the next target or candidate boundary; an in-flight network request may finish first.
+
+The **Results** page shows EASM Assets, all Candidates, Shared Infrastructure, Rejected results and candidates with Evidence. Search by IP, organization, hostname or ASN; double-click a row to see its proof and evidence. **History** reopens prior runs or loads their targets for a retry. **Organizations** groups stored results by parent organization. Excel and JSON are created only by **Export**.
+
+A known target ASN is excluded before IP verification and remains visible as `KNOWN_ASN_EXCLUDED`. Only `CONFIRMED_OWNED`, `CONFIRMED_LEASED` and `CONFIRMED_OPERATED` enter EASM Assets. The existing conservative attribution engine determines scores and relationships; the UI displays its results.
+
+### Data, credentials and diagnostics
+
+Analysis history is stored in SQLite at `%LOCALAPPDATA%\AtlasEASM\atlas.db` on Windows or `~/.local/share/AtlasEASM/atlas.db` on Unix. Set `EASM_DATA_DIR` to choose another location. The existing SQLite cache path lives beside the database. Optional provider credentials use environment variables or a local `.env`: `SHODAN_API_KEY`, `CENSYS_API_TOKEN`, `CENSYS_ORG_ID`. Keep `.env` private; credentials are not written to result rows. Without optional credentials, the core pipeline still runs and historical DNS can be unavailable. Network providers, DNS and TLS require outbound access. Per-IP verification errors remain visible in Results as `ERROR`; a failed run is recorded in History.
+
+### Tests and Windows packaging
+
+```powershell
+python -m pip install pytest
+python -m pytest -q tests
+```
+
+Run `build.bat` on Windows to build `dist\AtlasEASM.exe` with PyInstaller. Packaging requires a Windows machine; the Linux cloud environment can validate imports and the Qt launch path but cannot validate a Windows executable.
