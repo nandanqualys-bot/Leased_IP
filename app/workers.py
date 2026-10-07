@@ -19,6 +19,8 @@ class AnalysisWorker(QThread):
         self.cancel_requested = True
 
     def run(self):
+        from .credentials import activate
+        activate()
         store = Store(self.db_path)
         log_path = store.path.parent / 'atlas.log'
         logger = logging.getLogger('atlas.desktop')
@@ -42,4 +44,56 @@ class AnalysisWorker(QThread):
             logger.exception('Analysis %s failed', run_id)
         store.finish(run_id, records, status, error)
         logger.info('Analysis %s %s (%s results)', run_id, status, len(records))
+        self.completed.emit(run_id, status, error)
+
+
+class ReverifyWorker(QThread):
+    """Verify one saved off-ASN candidate with fresh provider observations."""
+    progress = Signal(str, int, int, str)
+    completed = Signal(int, str, str)
+
+    def __init__(self, db_path, target, previous, cfg=None):
+        super().__init__()
+        self.db_path = db_path
+        self.target = target
+        self.previous = previous
+        self.cfg = cfg
+
+    def run(self):
+        from .engine import verification, classify, config, canonical_asn, VerificationClient
+        from .credentials import activate
+        activate()
+        store = Store(self.db_path)
+        run_id = store.start([self.target])
+        records = []
+        status, error = 'COMPLETED', ''
+        try:
+            candidate = dict(self.previous['candidate'])
+            self.progress.emit('reverification', 1, 1, candidate['ip'])
+            effective_config = self.cfg or config()
+            client = VerificationClient(effective_config)
+            network = verification.ripe_network(client, candidate['ip'])
+            origins = [canonical_asn(str(asn)) for asn in network.get('asns', [])]
+            known = {canonical_asn(asn) for asn in self.target.get('known_asns', [])}
+            if any(origin in known for origin in origins):
+                origin = next(origin for origin in origins if origin in known)
+                candidate['origin_asn'] = origin
+                finding = {'relationship': 'Known target ASN', 'confidence': 'EXCLUDED',
+                           'proof': f"{candidate['ip']} is now originated by {origin}, a known target ASN. Excluded before verification.",
+                           'evidence': [('Known ASN', f'Origin {origin} matches target ASN', 0)]}
+                classification = 'KNOWN_ASN_EXCLUDED'
+            else:
+                finding = verification.score_candidate(self.target, candidate, client, effective_config)
+                classification = classify(finding)
+            records = [{
+                'organization': self.target['parent_organization'],
+                'entity': self.target['target_entity'],
+                'domains': self.target['target_domains'],
+                'ip': candidate['ip'], 'hostname': candidate.get('hostname', ''),
+                'candidate': candidate, 'finding': finding, 'status': classification,
+                'included': classification in ('CONFIRMED_OWNED','CONFIRMED_LEASED','CONFIRMED_OPERATED'),
+            }]
+        except Exception as exc:
+            status, error = 'FAILED', str(exc)
+        store.finish(run_id, records, status, error)
         self.completed.emit(run_id, status, error)

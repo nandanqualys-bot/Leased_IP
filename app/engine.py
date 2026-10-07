@@ -22,6 +22,13 @@ def _load(name: str, filename: str):
 input_engine = _load('easm_input', '01_generate_input.py')
 discovery = _load('easm_discovery', '02_off_asn_discovery.py')
 verification = _load('easm_verification', '04_ip_verification.py')
+from .cache import CachedGet
+
+class DiscoveryClient(CachedGet, discovery.HttpClient):
+    pass
+
+class VerificationClient(CachedGet, verification.Client):
+    pass
 
 
 def canonical_asn(value: str) -> str:
@@ -58,8 +65,11 @@ def config():
 def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, cfg=None) -> list[dict]:
     """Return verified and excluded records; never write Excel during analysis."""
     cfg = cfg or config()
-    client_d = discovery.HttpClient(cfg.get('timeouts', {}).get('http', 15), cfg.get('max_retries', 2), cfg.get('request_delay', .2))
-    client_v = verification.Client(cfg)
+    client_d = DiscoveryClient(cfg.get('timeouts', {}).get('http', 15), cfg.get('max_retries', 2), cfg.get('request_delay', .2))
+    client_v = VerificationClient(cfg)
+    if cfg.get('cache_db'):
+        client_d.set_cache(cfg['cache_db'])
+        client_v.set_cache(cfg['cache_db'])
     all_records = []
     for index, target in enumerate(targets, 1):
         if cancelled():

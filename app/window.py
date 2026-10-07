@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxL
 
 from .engine import input_engine, normalize_targets, targets_from_excel, slug
 from .storage import Store
-from .workers import AnalysisWorker
+from .workers import AnalysisWorker, ReverifyWorker
+from .credentials import presence as credential_presence, save as save_credentials
 from .export import export_results, filename
 from .theme import LIGHT, DARK
 
@@ -251,6 +252,7 @@ class MainWindow(QMainWindow):
         self.org_filter = QComboBox(); self.org_filter.currentIndexChanged.connect(self.filter_results)
         controls.addWidget(self.org_filter)
         controls.addWidget(button('Export', self.export_current)); outer.addLayout(controls)
+        controls.addWidget(button('Reverify selected IP', self.reverify_selected))
         self.tabs = QTabWidget(); self.result_tables = {}
         for title in ('EASM Assets', 'Candidates', 'Shared Infrastructure', 'Rejected', 'Evidence'):
             tab = table(['IP', 'Organization', 'Domain', 'Origin ASN', 'Relationship', 'Confidence', 'Status'])
@@ -313,6 +315,28 @@ class MainWindow(QMainWindow):
             export_results(group, path)
             self.statusBar().showMessage(f'Exported {path}')
         except Exception as exc: QMessageBox.warning(self, 'Export failed', str(exc))
+
+    def reverify_selected(self):
+        if self.worker and self.worker.isRunning(): return
+        tab = self.tabs.currentWidget()
+        selected = tab.currentRow()
+        item = tab.item(selected, 0) if selected >= 0 else None
+        if item is None:
+            QMessageBox.information(self, 'Reverify', 'Select a candidate IP first.'); return
+        title = list(self.result_tables)[self.tabs.currentIndex()]
+        row = self.visible_rows[title][item.data(Qt.UserRole)]
+        if row['status'] == 'KNOWN_ASN_EXCLUDED':
+            QMessageBox.information(self, 'Known ASN', 'This IP matched a known target ASN and is excluded before verification.'); return
+        target = next((t for t in self.store.targets(self.current_run)
+                       if t['parent_organization'].lower() == row['organization'].lower()
+                       and t['target_entity'] == row['entity'] and t['target_domains'] == row['domains']), None)
+        if target is None:
+            QMessageBox.warning(self, 'Reverify', 'The target for this saved IP could not be found.'); return
+        self.worker = ReverifyWorker(self.store.path, target, row, self._runtime_config())
+        self.worker.progress.connect(self.on_progress)
+        self.worker.completed.connect(self.on_completed)
+        self.start_button.setEnabled(False)
+        self.worker.start()
 
     def _organizations(self):
         page, outer = self._page('Organizations')
@@ -388,9 +412,28 @@ class MainWindow(QMainWindow):
         form.addRow('Workers', self.workers_spin); form.addRow('HTTP timeout (seconds)', self.timeout_spin)
         outer.addLayout(form)
         outer.addWidget(label(f'Local database: {self.store.path}'))
-        outer.addWidget(label('Optional provider credentials: set SHODAN_API_KEY, CENSYS_API_TOKEN and CENSYS_ORG_ID in your local environment or .env file. Values are never shown or saved in analysis results.'))
+        outer.addWidget(label('Optional provider credentials are stored in a local .env beside the database. Existing values are never displayed. Leave a field blank to keep its value.'))
+        credentials = QFormLayout()
+        self.credential_inputs = {}
+        for name in ('SHODAN_API_KEY','CENSYS_API_TOKEN','CENSYS_ORG_ID'):
+            entry = QLineEdit(); entry.setEchoMode(QLineEdit.Password)
+            entry.setPlaceholderText('Configured' if credential_presence()[name] else 'Not configured')
+            self.credential_inputs[name] = entry
+            credentials.addRow(name, entry)
+        outer.addLayout(credentials)
+        outer.addWidget(button('Save provider credentials', self.save_provider_credentials))
         outer.addStretch()
         return page
+
+    def save_provider_credentials(self):
+        try:
+            save_credentials({name: field.text() for name, field in self.credential_inputs.items()})
+            for name, field in self.credential_inputs.items():
+                field.clear()
+                field.setPlaceholderText('Configured' if credential_presence()[name] else 'Not configured')
+            self.statusBar().showMessage('Provider settings saved locally')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Settings error', str(exc))
 
     def apply_theme(self, name):
         self.settings.setValue('theme', name)

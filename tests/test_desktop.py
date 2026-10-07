@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLineEdit
 from app import engine
 from app.storage import Store
 from app.export import export_results, filename
@@ -109,3 +109,77 @@ def test_direct_sample_analysis_persists(app, tmp_path, monkeypatch):
     reopened=Store(tmp_path/'run.db')
     assert len(reopened.results(run))==2
     assert reopened.results(run)[0]['organization']=='Example'
+
+
+def test_provider_settings_are_private_and_masked(app, tmp_path, monkeypatch):
+    monkeypatch.setenv('EASM_DATA_DIR',str(tmp_path))
+    from app import credentials
+    credentials.save({'SHODAN_API_KEY':'example-test-value'})
+    assert credentials.path().read_text().find('example-test-value') >= 0
+    if os.name != 'nt': assert credentials.path().stat().st_mode & 0o077 == 0
+    assert credentials.presence()['SHODAN_API_KEY']
+    window=MainWindow(Store(tmp_path/'database.sqlite'))
+    assert window.credential_inputs['SHODAN_API_KEY'].text() == ''
+    assert window.credential_inputs['SHODAN_API_KEY'].echoMode() == QLineEdit.Password
+    window.close()
+    monkeypatch.delenv('SHODAN_API_KEY',raising=False)
+
+
+def test_reverify_creates_new_run(app, tmp_path, monkeypatch):
+    from app.workers import ReverifyWorker
+    target=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Example','Example','example.com','AS64500','']))])[0]
+    store=Store(tmp_path/'db.sqlite')
+    run=store.start([target]); old={'organization':'Example','entity':'Example','domains':['example.com'],
+        'ip':'1.1.1.1','hostname':'example.com',
+        'candidate':{'ip':'1.1.1.1','hostname':'example.com','origin_asn':'AS13335','discovery_sources':['DNS']},
+        'finding':{'confidence':'LOW','relationship':'Unverified','evidence':[]},
+        'status':'UNVERIFIED','included':False}
+    store.finish(run,[old])
+    monkeypatch.setattr(engine.verification,'score_candidate',lambda *a: {
+        'confidence':'HIGH','relationship':'Leased/Hosted','score':85,'evidence':[('TLS','match',25)],'proof':'Updated'})
+    monkeypatch.setattr(engine.verification,'ripe_network',lambda *a: {'asns':[13335]})
+    worker=ReverifyWorker(store.path,target,old,{'max_retries':0})
+    worker.start(); assert worker.wait(5000)
+    newer=store.runs()[0]['id']
+    assert newer != run
+    assert store.results(newer)[0]['status']=='CONFIRMED_LEASED'
+    assert store.results(run)[0]['status']=='UNVERIFIED'
+
+
+def test_reverify_rechecks_known_asn(app, tmp_path, monkeypatch):
+    from app.workers import ReverifyWorker
+    target=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Example','Example','example.com','AS27385','']))])[0]
+    store=Store(tmp_path/'db.sqlite')
+    old={'organization':'Example','entity':'Example','domains':['example.com'],'ip':'1.1.1.1',
+         'hostname':'example.com','candidate':{'ip':'1.1.1.1','origin_asn':'AS13335'},
+         'finding':{'evidence':[]},'status':'UNVERIFIED','included':False}
+    monkeypatch.setattr(engine.verification,'ripe_network',lambda *a: {'asns':[27385]})
+    def forbidden(*args): raise AssertionError('Known ASN must not reach verification')
+    monkeypatch.setattr(engine.verification,'score_candidate',forbidden)
+    worker=ReverifyWorker(store.path,target,old,{'max_retries':0})
+    worker.start(); assert worker.wait(5000)
+    assert store.results(store.runs()[0]['id'])[0]['status']=='KNOWN_ASN_EXCLUDED'
+
+
+def test_public_cache_reuses_get_without_storing_provider_keys(tmp_path):
+    import requests
+    from app.cache import CachedGet
+    class Provider:
+        calls = 0
+        def get(self, url, **kwargs):
+            self.calls += 1
+            response = requests.Response(); response.status_code=200
+            response.url=url; response._content=b'{"data":{"asns":[13335]}}'
+            response.headers['Content-Type']='application/json'
+            return response
+    class Client(CachedGet, Provider): pass
+    client=Client(); client.set_cache(tmp_path/'cache.db')
+    url='https://stat.ripe.net/data/network-info/data.json?resource=1.1.1.1'
+    assert client.get(url).json()['data']['asns']==[13335]
+    assert client.get(url).json()['data']['asns']==[13335]
+    assert client.calls==1
+    client.get('https://api.shodan.io/shodan/host/1.1.1.1',params={'key':'secret'})
+    assert client.calls==2
+    assert b'secret' not in (tmp_path/'cache.db').read_bytes()
