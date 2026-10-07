@@ -1,0 +1,47 @@
+{
+  "shodan_api_key": "",
+  "cache_db": "easm_cache.db",
+  "max_workers": 10,
+  "request_delay": 0.2,
+  "max_retries": 2,
+  "timeouts": {
+    "http": 15,
+    "dns": 10,
+    "tls": 15
+  },
+  "tls_ports": [
+    443,
+    8443,
+    9443,
+    10443,
+    4443,
+    7443
+  ],
+  "confidence_thresholds": {
+    "confirmed": 90,
+    "high": 75,
+    "medium": 50,
+    "low": 30
+  },
+  "evidence_scoring": {
+    "official_documentation": 30,
+    "current_dns": 25,
+    "tls_target": 25,
+    "ct_association": 20,
+    "historical_dns": 15,
+    "reverse_dns": 15,
+    "shodan_hostname_domain_certificate": 10,
+    "shodan_org_service": 10,
+    "rdap_target_match": 10,
+    "network_explicitly_associated": 10,
+    "negative_rdap_unrelated": -30,
+    "negative_tls_unrelated": -25,
+    "negative_dns_unrelated": -20,
+    "negative_shared_generic": -20
+  },
+  "censys_api_token": "",
+  "censys_org_id": "",
+  "censys_history_days": 31,
+  "enable_censys": true,
+  "enable_in_memory_caching": true
+}
