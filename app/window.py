@@ -1,15 +1,14 @@
 """Qt desktop shell, target workflow, history, results, and evidence inspection."""
 from __future__ import annotations
-import json
-from pathlib import Path
+import time
 
-from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QSettings, QTimer, QPropertyAnimation, QEasingCurve, QEvent
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QLineEdit, QFileDialog, QMessageBox, QTabWidget, QFormLayout, QSpinBox,
-    QComboBox, QDialog, QDialogButtonBox, QProgressBar, QPlainTextEdit, QCheckBox,
-    QAbstractItemView, QApplication, QGraphicsDropShadowEffect)
+    QComboBox, QDialog, QProgressBar, QPlainTextEdit,
+    QAbstractItemView, QApplication, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QScrollArea)
 
 from .engine import input_engine, normalize_targets, targets_from_excel, slug
 from .storage import Store
@@ -27,10 +26,46 @@ def label(text, kind=None):
 
 
 def button(text, callback, primary=False):
-    widget = QPushButton(text)
+    widget = SoftButton(text)
     if primary: widget.setObjectName('primary')
     widget.clicked.connect(callback)
     return widget
+
+
+class SoftButton(QPushButton):
+    """Lightweight opacity feedback while the stylesheet handles color and shape."""
+    def __init__(self, text):
+        super().__init__(text)
+        self.setCursor(Qt.PointingHandCursor)
+        self.fade = QGraphicsOpacityEffect(self)
+        self.fade.setOpacity(1.0)
+        self.setGraphicsEffect(self.fade)
+        self.fade_animation = None
+
+    def _fade_to(self, value):
+        if self.fade_animation:
+            self.fade_animation.stop()
+        self.fade_animation = QPropertyAnimation(self.fade, b'opacity', self)
+        self.fade_animation.setDuration(130)
+        self.fade_animation.setStartValue(self.fade.opacity())
+        self.fade_animation.setEndValue(value)
+        self.fade_animation.start()
+
+    def enterEvent(self, event):
+        self._fade_to(0.86)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._fade_to(1.0)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._fade_to(0.7)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._fade_to(0.86 if self.underMouse() else 1.0)
+        super().mouseReleaseEvent(event)
 
 
 def card(kind='panel', shadow=False):
@@ -59,6 +94,7 @@ def table(columns):
     widget.setSelectionBehavior(QAbstractItemView.SelectRows)
     widget.setEditTriggers(QAbstractItemView.NoEditTriggers)
     widget.horizontalHeader().setStretchLastSection(True)
+    widget.horizontalHeader().setDefaultSectionSize(150)
     widget.verticalHeader().setVisible(False)
     widget.setAlternatingRowColors(True)
     widget.verticalHeader().setDefaultSectionSize(42)
@@ -75,7 +111,6 @@ def fill(widget, rows):
             item.setData(Qt.UserRole, r)
             widget.setItem(r, c, item)
     widget.setSortingEnabled(True)
-    widget.resizeColumnsToContents()
 
 
 class DetailDialog(QDialog):
@@ -114,6 +149,32 @@ class DetailDialog(QDialog):
         layout.addLayout(actions)
 
 
+class JobCard(QFrame):
+    def __init__(self, organization, pause, cancel, logs):
+        super().__init__()
+        self.setObjectName('metricCard')
+        layout = QVBoxLayout(self); layout.setContentsMargins(20, 16, 20, 16)
+        title = QHBoxLayout()
+        title.addWidget(label(organization, 'sectionTitle'), 1)
+        self.status = label('Queued', 'statusChip'); title.addWidget(self.status)
+        layout.addLayout(title)
+        self.progress = QProgressBar(); self.progress.setRange(0, 100)
+        layout.addWidget(self.progress)
+        self.metrics = label('Elapsed  0:00     Hostnames  0     Candidates  0     Verified  0', 'muted')
+        layout.addWidget(self.metrics)
+        actions = QHBoxLayout()
+        self.pause_button = button('Pause', pause)
+        actions.addWidget(self.pause_button)
+        actions.addWidget(button('Cancel', cancel))
+        actions.addWidget(button('Logs', logs))
+        actions.addStretch(); layout.addLayout(actions)
+
+    def update_metrics(self, elapsed, hostnames, candidates, verified):
+        minutes, seconds = divmod(int(elapsed), 60)
+        self.metrics.setText(f'Elapsed  {minutes}:{seconds:02d}     Hostnames  {hostnames}     '
+                             f'Candidates  {candidates}     Verified  {verified}')
+
+
 class MainWindow(QMainWindow):
     def __init__(self, store=None):
         super().__init__()
@@ -123,44 +184,88 @@ class MainWindow(QMainWindow):
         self.current_run = None
         self.current_rows = []
         self.worker = None
+        self.jobs = {}
+        self.pending_jobs = []
+        self.next_job_id = 1
+        self.system_dark = QApplication.palette().color(QPalette.Window).lightness() < 128
         self.setWindowTitle('Atlas EASM · Off-ASN intelligence')
-        self.setMinimumSize(1120, 720)
-        self.resize(1440, 900)
+        self.setMinimumSize(980, 620)
+        self.resize(1360, 820)
         self._build()
-        self.apply_theme(self.settings.value('theme', 'Light'))
+        QApplication.instance().installEventFilter(self)
+        self.apply_theme(self.settings.value('theme', 'System'))
         self.refresh()
 
     def _build(self):
         host = QWidget(); self.setCentralWidget(host)
         horizontal = QHBoxLayout(host); horizontal.setContentsMargins(0,0,0,0)
-        sidebar = QFrame(); sidebar.setObjectName('sidebar'); sidebar.setFixedWidth(236)
+        sidebar = QFrame(); sidebar.setObjectName('sidebar')
+        sidebar.setMinimumWidth(68); sidebar.setMaximumWidth(236)
+        self.sidebar = sidebar
         nav = QVBoxLayout(sidebar); nav.setContentsMargins(20,30,20,22); nav.setSpacing(8)
-        nav.addWidget(label('◈  ATLAS', 'brand'))
-        nav.addWidget(label('EASM  /  INTELLIGENCE', 'eyebrow'))
+        self.nav_layout = nav
+        brand_row = QHBoxLayout()
+        self.brand_label = label('◈  ATLAS', 'brand'); brand_row.addWidget(self.brand_label, 1)
+        self.collapse_button = button('‹', self.toggle_sidebar)
+        self.collapse_button.setToolTip('Collapse sidebar')
+        self.collapse_button.setFixedWidth(34); brand_row.addWidget(self.collapse_button)
+        nav.addLayout(brand_row)
+        self.brand_subtitle = label('EASM  /  INTELLIGENCE', 'eyebrow')
+        nav.addWidget(self.brand_subtitle)
         nav.addSpacing(38)
-        nav.addWidget(label('WORKSPACE', 'eyebrow'))
+        self.workspace_label = label('WORKSPACE', 'eyebrow')
+        nav.addWidget(self.workspace_label)
         self.stack = QStackedWidget()
+        pages = [self._dashboard, self._new_analysis, self._results, self._organizations,
+                 self._history, self._settings, self._running_jobs, self._evidence_view]
+        for method in pages:
+            self.stack.addWidget(method())
         self.nav_buttons = []
-        for name, method in [('Dashboard', self._dashboard), ('New Analysis', self._new_analysis),
-                             ('Results', self._results), ('Organizations', self._organizations),
-                             ('History', self._history), ('Settings', self._settings)]:
-            index = self.stack.addWidget(method())
-            item = button(name, lambda _=False, i=index: self.navigate(i))
+        self.nav_entries = [('Dashboard', 0, '◈'), ('New Analysis', 1, '+'),
+                            ('Running Jobs', 6, '◷'), ('Analysis History', 4, '≡'),
+                            ('Assets', 2, '◆'), ('Evidence', 7, '▤'),
+                            ('Organizations', 3, '◎'), ('Settings', 5, '⚙')]
+        for name, index, icon in self.nav_entries:
+            item = button(f'{icon}    {name}', lambda _=False, i=index: self.navigate(i))
             item.setObjectName('navItem'); item.setCursor(Qt.PointingHandCursor)
+            item.setToolTip(name)
             self.nav_buttons.append(item); nav.addWidget(item)
         nav.addStretch()
-        nav.addWidget(label('LOCAL DESKTOP APP', 'eyebrow'))
-        nav.addWidget(label('Private analysis workspace', 'muted'))
+        self.footer_title = label('LOCAL DESKTOP APP', 'eyebrow')
+        self.footer_note = label('Private analysis workspace', 'muted')
+        nav.addWidget(self.footer_title); nav.addWidget(self.footer_note)
         horizontal.addWidget(sidebar); horizontal.addWidget(self.stack,1)
         self.statusBar().showMessage('Ready')
+        self.job_timer = QTimer(self); self.job_timer.timeout.connect(self.update_job_elapsed)
+        self.job_timer.start(1000)
         self.navigate(0)
 
     def navigate(self, index):
+        if index == 7:
+            self.refresh_evidence()
         self.stack.setCurrentIndex(index)
-        for i, item in enumerate(self.nav_buttons):
-            item.setProperty('active', i == index)
+        for item, (_, page_index, _) in zip(self.nav_buttons, self.nav_entries):
+            item.setProperty('active', page_index == index)
             item.style().unpolish(item); item.style().polish(item)
         if index in (0, 3, 4): self.refresh()
+
+    def toggle_sidebar(self):
+        collapsed = self.sidebar.maximumWidth() > 100
+        target = 68 if collapsed else 236
+        self.nav_layout.setContentsMargins(8 if collapsed else 20,30,8 if collapsed else 20,22)
+        for item, (name, _, icon) in zip(self.nav_buttons, self.nav_entries):
+            item.setText(icon if collapsed else f'{icon}    {name}')
+        for widget in (self.brand_label, self.brand_subtitle, self.workspace_label,
+                       self.footer_title, self.footer_note):
+            widget.setVisible(not collapsed)
+        self.collapse_button.setText('›' if collapsed else '‹')
+        self.collapse_button.setToolTip('Expand sidebar' if collapsed else 'Collapse sidebar')
+        self.sidebar_animation = QPropertyAnimation(self.sidebar, b'maximumWidth', self)
+        self.sidebar_animation.setDuration(220)
+        self.sidebar_animation.setStartValue(self.sidebar.maximumWidth())
+        self.sidebar_animation.setEndValue(target)
+        self.sidebar_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.sidebar_animation.start()
 
     def _page(self, title):
         page = QWidget(); outer = QVBoxLayout(page)
@@ -199,12 +304,13 @@ class MainWindow(QMainWindow):
 
     def _new_analysis(self):
         page, outer = self._page('New analysis')
+        outer.setContentsMargins(24, 20, 24, 20); outer.setSpacing(11)
         outer.addWidget(label('Define the organizations and domains you are authorized to assess.', 'muted'))
         outer.addWidget(label('01  /  Target information', 'sectionTitle'))
         form_panel = card('panel')
         form = QFormLayout()
-        form.setContentsMargins(22, 20, 22, 20)
-        form.setHorizontalSpacing(24); form.setVerticalSpacing(13)
+        form.setContentsMargins(18, 14, 18, 14)
+        form.setHorizontalSpacing(22); form.setVerticalSpacing(9)
         self.parent_name = QLineEdit(); self.entity = QLineEdit(); self.domain = QLineEdit()
         self.asns = QLineEdit(); self.registrants = QLineEdit()
         for title, widget in [('Parent organization', self.parent_name), ('Target entity', self.entity),
@@ -215,17 +321,33 @@ class MainWindow(QMainWindow):
         actions.addWidget(button('Add target', self.add_manual, True))
         actions.addWidget(button('Import Excel', self.import_excel))
         actions.addWidget(button('Download template', self.template))
+        clear = button('Clear Workspace', self.clear_workspace)
+        clear.setObjectName('danger'); actions.addWidget(clear)
+        actions.addWidget(button('Remove selected', self.remove_target))
         actions.addStretch(); outer.addLayout(actions)
         outer.addWidget(label('02  /  Review targets', 'sectionTitle'))
         self.preview = table(['Parent organization', 'Target entity', 'Domain', 'Known ASNs', 'Registrant names'])
         self.preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         outer.addWidget(self.preview,1)
-        outer.addWidget(button('Remove selected', self.remove_target))
-        self.start_button = button('Run analysis', self.start_analysis, True); outer.addWidget(self.start_button)
-        self.progress = QProgressBar(); outer.addWidget(self.progress)
-        self.progress_text = label(''); outer.addWidget(self.progress_text)
-        outer.addWidget(button('Cancel running analysis', self.cancel_analysis))
-        return page
+        self.start_button = button('Run analysis', self.start_analysis, True)
+        self.progress = QProgressBar(); self.progress.hide()
+        self.progress_text = label(''); self.progress_text.hide()
+        self.cancel_button = button('Cancel running analysis', self.cancel_analysis)
+        self.cancel_button.setObjectName('danger')
+        self.cancel_button.hide()
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame); scroll.setWidget(page)
+        wrapper = QWidget(); wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 0); wrapper_layout.setSpacing(0)
+        wrapper_layout.addWidget(scroll, 1)
+        footer = card('panel'); footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(24, 8, 24, 8)
+        footer_layout.addWidget(self.start_button)
+        footer_layout.addWidget(self.progress)
+        footer_layout.addWidget(self.progress_text)
+        footer_layout.addWidget(self.cancel_button)
+        wrapper_layout.addWidget(footer)
+        return wrapper
 
     def add_manual(self):
         row = dict(zip(input_engine.COLUMNS, [self.parent_name.text(), self.entity.text(),
@@ -242,9 +364,39 @@ class MainWindow(QMainWindow):
         if not path: return
         try:
             targets = targets_from_excel(path)
-            self.current_targets.extend(targets)
+            choice = QMessageBox(self)
+            choice.setWindowTitle('Import targets')
+            choice.setText(f'How should {len(targets)} imported target(s) enter this workspace?')
+            choice.setInformativeText('Historical analyses stay saved in the local database.')
+            replace = choice.addButton('Replace Current Workspace', QMessageBox.AcceptRole)
+            append = choice.addButton('Append to Workspace', QMessageBox.ActionRole)
+            choice.addButton('Cancel', QMessageBox.RejectRole)
+            choice.setDefaultButton(replace)
+            choice.exec()
+            if choice.clickedButton() is replace:
+                self.clear_workspace()
+                self.current_targets = list(targets)
+            elif choice.clickedButton() is append:
+                self.current_targets.extend(targets)
+            else:
+                return
             self.show_preview()
         except Exception as exc: QMessageBox.warning(self, 'Import failed', str(exc))
+
+    def clear_workspace(self):
+        self.current_targets = []
+        self.show_preview()
+        for widget in (self.parent_name, self.entity, self.domain, self.asns, self.registrants):
+            widget.clear()
+        self.current_run = None
+        self.current_rows = []
+        self.search.clear()
+        self.run_heading.setText('Open an analysis from History to inspect saved results.')
+        self.filter_results()
+        self.progress.setValue(0)
+        self.progress_text.clear()
+        self.progress.hide(); self.progress_text.hide(); self.cancel_button.hide()
+        self.statusBar().showMessage('Current workspace cleared; saved history is intact')
 
     def template(self):
         path, _ = QFileDialog.getSaveFileName(self, 'Save input template', 'targets_template.xlsx', 'Excel files (*.xlsx)')
@@ -270,7 +422,6 @@ class MainWindow(QMainWindow):
     def start_analysis(self):
         if not self.current_targets:
             QMessageBox.information(self, 'No targets', 'Add or import a target first.'); return
-        if self.worker and self.worker.isRunning(): return
         # Revalidate the whole preview so duplicates across separate imports are caught.
         rows = [dict(zip(input_engine.COLUMNS, [t['parent_organization'], t['target_entity'],
                  ';'.join(t['target_domains']), ';'.join(t['known_asns']),
@@ -279,15 +430,117 @@ class MainWindow(QMainWindow):
             self.current_targets = normalize_targets(rows)
         except ValueError as exc:
             QMessageBox.warning(self, 'Invalid target list', str(exc)); return
-        cfg = self._runtime_config()
-        self.worker = AnalysisWorker(self.store.path, list(self.current_targets), cfg)
-        self.worker.progress.connect(self.on_progress)
-        self.worker.completed.connect(self.on_completed)
-        self.start_button.setEnabled(False)
-        self.progress.setRange(0, len(self.current_targets))
-        self.progress.setValue(0)
-        self.progress_text.setText('Starting analysis…')
-        self.worker.start()
+        grouped = {}
+        for target in self.current_targets:
+            grouped.setdefault(target['parent_organization'].casefold(), []).append(target)
+        for targets in grouped.values():
+            job_id = self.next_job_id; self.next_job_id += 1
+            organization = targets[0]['parent_organization']
+            card_widget = JobCard(organization,
+                lambda _=False, i=job_id: self.toggle_job_pause(i),
+                lambda _=False, i=job_id: self.cancel_job(i),
+                lambda _=False, i=job_id: self.show_job_logs(i))
+            card_widget.pause_button.setEnabled(False)
+            self.jobs_layout.insertWidget(self.jobs_layout.count()-1, card_widget)
+            self.jobs[job_id] = {'organization':organization, 'targets':list(targets),
+                'card':card_widget, 'status':'Queued', 'worker':None, 'started':None,
+                'hostnames':0, 'candidates':0, 'verified':0, 'finished':False}
+            self.pending_jobs.append(job_id)
+        self.jobs_empty.hide()
+        self._pump_jobs()
+        self.navigate(6)
+
+    def _pump_jobs(self):
+        active = sum(bool(job['worker']) and not job['finished'] for job in self.jobs.values())
+        limit = self.workers_spin.value()
+        while self.pending_jobs and active < limit:
+            job_id = self.pending_jobs.pop(0)
+            job = self.jobs[job_id]
+            worker = AnalysisWorker(self.store.path, job['targets'], self._runtime_config())
+            job['worker'] = worker; job['status'] = 'Running'; job['started'] = time.monotonic()
+            job['card'].status.setText('Running')
+            job['card'].pause_button.setEnabled(True)
+            worker.progress.connect(lambda stage,current,total,item,i=job_id:
+                                    self.on_job_progress(i,stage,current,total,item))
+            worker.completed.connect(lambda run_id,status,error,i=job_id:
+                                     self.on_job_completed(i,run_id,status,error))
+            worker.start()
+            active += 1
+
+    def on_job_progress(self, job_id, stage, current, total, item):
+        job = self.jobs[job_id]
+        if stage == 'candidates':
+            job['candidates'] += current
+            job['hostnames'] += int(item)
+        elif stage == 'verified':
+            job['verified'] += 1
+        if job['candidates']:
+            job['card'].progress.setValue(min(95, int(job['verified'] * 100 / job['candidates'])))
+        job['card'].update_metrics(time.monotonic()-job['started'],
+                                   job['hostnames'],job['candidates'],job['verified'])
+        self.statusBar().showMessage(f"{job['organization']} · {stage.title()} · {item}")
+
+    def on_job_completed(self, job_id, run_id, status, error):
+        job = self.jobs[job_id]
+        job['finished'] = True
+        job['status'] = status.title()
+        job['run_id'] = run_id
+        job['card'].status.setText(job['status'])
+        job['card'].progress.setValue(100 if status == 'COMPLETED' else job['card'].progress.value())
+        job['card'].pause_button.setEnabled(False)
+        self.statusBar().showMessage(f"{job['organization']} · {status.title()}" + (f' · {error}' if error else ''))
+        self.refresh(); self._pump_jobs()
+        QTimer.singleShot(2500, lambda i=job_id: self._retire_job_card(i))
+        if not any(not j['finished'] for j in self.jobs.values()):
+            self.open_run(run_id)
+
+    def _retire_job_card(self, job_id):
+        job = self.jobs.get(job_id)
+        if job and job['finished']:
+            job['card'].hide()
+            self.jobs_layout.removeWidget(job['card'])
+            job['card'].deleteLater()
+        self.jobs_empty.setVisible(not any(not j['finished'] for j in self.jobs.values()))
+
+    def toggle_job_pause(self, job_id):
+        job = self.jobs[job_id]
+        if job['status'] == 'Running':
+            job['worker'].pause(); job['status'] = 'Paused'
+            job['card'].status.setText('Paused')
+            job['card'].pause_button.setText('Resume')
+        elif job['status'] == 'Paused':
+            job['worker'].resume(); job['status'] = 'Running'
+            job['card'].status.setText('Running')
+            job['card'].pause_button.setText('Pause')
+
+    def cancel_job(self, job_id):
+        job = self.jobs[job_id]
+        if job['finished']: return
+        if job['worker']:
+            job['worker'].cancel()
+        else:
+            self.pending_jobs.remove(job_id)
+            job['finished'] = True
+            QTimer.singleShot(2500, lambda i=job_id: self._retire_job_card(i))
+        job['status'] = 'Cancelled'; job['card'].status.setText('Cancelled')
+        job['card'].pause_button.setEnabled(False)
+        self._pump_jobs()
+
+    def update_job_elapsed(self):
+        for job in self.jobs.values():
+            if job['started'] and not job['finished']:
+                job['card'].update_metrics(time.monotonic()-job['started'],
+                    job['hostnames'],job['candidates'],job['verified'])
+
+    def show_job_logs(self, job_id):
+        log_path = self.store.path.parent / 'atlas.log'
+        dialog = QDialog(self); dialog.setWindowTitle(f"{self.jobs[job_id]['organization']} · Logs")
+        dialog.resize(720, 480)
+        layout = QVBoxLayout(dialog)
+        output = QPlainTextEdit(); output.setReadOnly(True)
+        output.setPlainText(log_path.read_text(encoding='utf-8')[-12000:] if log_path.exists() else 'No log entries yet.')
+        layout.addWidget(output); layout.addWidget(button('Close', dialog.accept))
+        dialog.exec()
 
     def _runtime_config(self):
         from .engine import config
@@ -314,7 +567,7 @@ class MainWindow(QMainWindow):
         self.open_run(run_id)
 
     def _results(self):
-        page, outer = self._page('Results')
+        page, outer = self._page('Assets')
         self.run_heading = label('Open an analysis from Dashboard or History.', 'muted'); outer.addWidget(self.run_heading)
         overview = QHBoxLayout(); overview.setSpacing(14)
         self.result_numbers = []
@@ -323,6 +576,8 @@ class MainWindow(QMainWindow):
             tile, value = metric(title, '0', note)
             overview.addWidget(tile); self.result_numbers.append(value)
         outer.addLayout(overview)
+        self.key_findings = label('Open an analysis to review its main findings.', 'muted')
+        outer.addWidget(self.key_findings)
         controls = QHBoxLayout()
         self.search = QLineEdit(); self.search.setPlaceholderText('Search IP, organization, ASN, hostname…')
         self.search.textChanged.connect(self.filter_results); controls.addWidget(self.search,1)
@@ -333,19 +588,63 @@ class MainWindow(QMainWindow):
         controls.addWidget(button('Reverify selected IP', self.reverify_selected))
         self.tabs = QTabWidget(); self.result_tables = {}
         for title in ('EASM Assets', 'Candidates', 'Shared Infrastructure', 'Rejected', 'Evidence'):
-            tab = table(['IP', 'Organization', 'Domain', 'Origin ASN', 'Relationship', 'Confidence', 'Status'])
+            tab = table(['IP', 'Organization', 'Relationship', 'Provider', 'Confidence', 'Status'])
+            for column in range(tab.columnCount()-1):
+                width = self.settings.value(f'table/{title}/{column}', None)
+                if width is not None: tab.setColumnWidth(column, int(width))
+            tab.horizontalHeader().sectionResized.connect(
+                lambda column,_old,new,section=title: self.settings.setValue(f'table/{section}/{column}', new))
+            tab.cellClicked.connect(lambda row, col, widget=tab: self.open_detail(widget, row))
             tab.cellDoubleClicked.connect(lambda row, col, widget=tab: self.open_detail(widget, row))
             self.result_tables[title] = tab; self.tabs.addTab(tab, title)
-        outer.addWidget(self.tabs, 1)
+        result_body = QHBoxLayout(); result_body.setSpacing(12)
+        result_body.addWidget(self.tabs, 1)
+        self.inspector = card('panel'); self.inspector.setMinimumWidth(0)
+        self.inspector.setMaximumWidth(0); self.inspector.hide()
+        inspector_layout = QVBoxLayout(self.inspector)
+        inspector_layout.setContentsMargins(18, 16, 18, 16)
+        header = QHBoxLayout()
+        header.addWidget(label('IP INSPECTOR', 'eyebrow'), 1)
+        header.addWidget(button('×', self.close_inspector))
+        inspector_layout.addLayout(header)
+        self.inspector_ip = label('', 'sectionTitle'); inspector_layout.addWidget(self.inspector_ip)
+        self.inspector_status = label('', 'statusChip'); inspector_layout.addWidget(self.inspector_status)
+        self.inspector_tabs = QTabWidget()
+        proof = QWidget(); proof_layout = QVBoxLayout(proof)
+        self.inspector_proof = label(''); proof_layout.addWidget(self.inspector_proof)
+        proof_layout.addStretch()
+        self.inspector_tabs.addTab(proof, 'Proof')
+        evidence_tab = QWidget(); evidence_layout = QVBoxLayout(evidence_tab)
+        self.inspector_evidence = QPlainTextEdit(); self.inspector_evidence.setReadOnly(True)
+        evidence_layout.addWidget(self.inspector_evidence)
+        self.inspector_tabs.addTab(evidence_tab, 'Evidence')
+        infrastructure = QWidget(); infra_layout = QVBoxLayout(infrastructure)
+        self.inspector_infra = label(''); infra_layout.addWidget(self.inspector_infra)
+        infra_layout.addStretch(); self.inspector_tabs.addTab(infrastructure, 'Network')
+        timeline = QWidget(); time_layout = QVBoxLayout(timeline)
+        self.inspector_timeline = label(''); time_layout.addWidget(self.inspector_timeline)
+        time_layout.addStretch(); self.inspector_tabs.addTab(timeline, 'Timeline')
+        inspector_layout.addWidget(self.inspector_tabs, 1)
+        self.inspector_copy = button('Copy IP', self.copy_inspector_ip)
+        inspector_layout.addWidget(self.inspector_copy)
+        result_body.addWidget(self.inspector)
+        outer.addLayout(result_body, 1)
         self.result_count = label(''); outer.addWidget(self.result_count)
         return page
 
     def open_run(self, run_id):
         self.current_run = run_id; self.current_rows = self.store.results(run_id)
         self.run_heading.setText(f'Analysis #{run_id} · {len(self.current_rows)} candidate IPs · double-click an IP for evidence')
+        included = sum(bool(row['included']) for row in self.current_rows)
+        shared = sum(row['status'] == 'SHARED_INFRASTRUCTURE' for row in self.current_rows)
+        excluded = len(self.current_rows) - included
+        self.key_findings.setText(
+            f'Key findings  ·  {included} defensible assets  ·  {shared} shared infrastructure  ·  '
+            f'{excluded} candidates excluded or awaiting stronger evidence')
         self.org_filter.blockSignals(True); self.org_filter.clear(); self.org_filter.addItem('All organizations')
         self.org_filter.addItems(sorted({r['organization'] for r in self.current_rows}))
         self.org_filter.blockSignals(False)
+        self.tabs.setCurrentIndex(0 if included else 1)
         self.filter_results(); self.navigate(2)
 
     def filter_results(self, *args):
@@ -366,8 +665,8 @@ class MainWindow(QMainWindow):
         self.visible_rows = groups
         for title, tab in self.result_tables.items():
             group = groups[title]
-            fill(tab, [[r['ip'], r['organization'], ';'.join(r['domains']),
-                        r['candidate'].get('origin_asn'), r['finding'].get('relationship'),
+            fill(tab, [[r['ip'], r['organization'], r['finding'].get('relationship'),
+                        r['finding'].get('origin_org') or r['candidate'].get('origin_organization'),
                         r['finding'].get('confidence'), r['status']] for r in group])
             self.tabs.setTabText(list(self.result_tables).index(title), f'{title} ({len(group)})')
         self.result_count.setText(f'{len(rows)} matching candidates · {len(groups["EASM Assets"])} defensible assets')
@@ -380,7 +679,76 @@ class MainWindow(QMainWindow):
         if not item: return
         for name, tab in self.result_tables.items():
             if widget is tab:
-                DetailDialog(self.visible_rows[name][item.data(Qt.UserRole)], self).exec(); return
+                self.show_inspector(self.visible_rows[name][item.data(Qt.UserRole)])
+                return
+
+    def show_inspector(self, row):
+        if not self.inspector.isVisible():
+            self._expanded_column_widths = {
+                name: [tab.columnWidth(column) for column in range(tab.columnCount())]
+                for name, tab in self.result_tables.items()}
+            for tab in self.result_tables.values():
+                header = tab.horizontalHeader(); header.blockSignals(True)
+                for column, width in enumerate((105, 120, 125, 110, 85, 150)):
+                    tab.setColumnWidth(column, width)
+                header.blockSignals(False)
+        self.inspector_row = row
+        finding, candidate = row['finding'], row['candidate']
+        self.inspector_ip.setText(row['ip'])
+        self.inspector_status.setText(row['status'].replace('_', ' '))
+        self.inspector_proof.setText(
+            f"{row['organization']} · {'; '.join(row['domains'])}\n\n"
+            f"{finding.get('proof') or 'No proof summary available.'}\n\n"
+            f"Classification: {finding.get('relationship', 'Unverified')}\n"
+            f"Confidence: {finding.get('confidence', 'Unknown')} · Score: {finding.get('score', '—')}\n"
+            f"{'Included in EASM' if row['included'] else 'Excluded from EASM'}")
+        observations = finding.get('evidence', [])
+        self.inspector_evidence.setPlainText('\n\n'.join(
+            f'{source}  ·  {points:+} points\n{detail}' for source, detail, points in observations)
+            or 'No provider evidence was recorded for this IP.')
+        self.inspector_infra.setText(
+            f"Current origin ASN\n{finding.get('origin_asn') or candidate.get('origin_asn') or 'Unknown'}\n\n"
+            f"Origin provider\n{finding.get('origin_org') or candidate.get('origin_organization') or 'Unknown'}\n\n"
+            f"RDAP registration\n{finding.get('registered_org') or 'Not available'}\n\n"
+            f"Current DNS hostnames\n{candidate.get('hostname') or 'None observed'}\n\n"
+            f"TLS\n{finding.get('tls', {}).get('cn') or 'No matching certificate recorded'}\n\n"
+            f"Reverse DNS\n{finding.get('ptr') or 'Not available'}")
+        self.inspector_timeline.setText(
+            f"First seen\n{candidate.get('first_seen') or 'Not available'}\n\n"
+            f"Last seen\n{candidate.get('last_seen') or 'Not available'}\n\n"
+            f"Analysis run\n#{row.get('run_id', self.current_run)}\n\n"
+            f"Discovery sources\n{'; '.join(candidate.get('discovery_sources', [])) or 'Not available'}")
+        self.inspector_tabs.setCurrentIndex(0)
+        if self.width() < 1200 and self.sidebar.maximumWidth() > 100:
+            self.toggle_sidebar()
+        self.inspector.show()
+        self.inspector_animation = QPropertyAnimation(self.inspector, b'maximumWidth', self)
+        self.inspector_animation.setDuration(230)
+        self.inspector_animation.setStartValue(self.inspector.maximumWidth())
+        self.inspector_animation.setEndValue(380)
+        self.inspector_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.inspector_animation.start()
+
+    def close_inspector(self):
+        self.inspector_animation = QPropertyAnimation(self.inspector, b'maximumWidth', self)
+        self.inspector_animation.setDuration(180)
+        self.inspector_animation.setStartValue(self.inspector.maximumWidth())
+        self.inspector_animation.setEndValue(0)
+        self.inspector_animation.finished.connect(self.inspector.hide)
+        self.inspector_animation.finished.connect(self._restore_result_columns)
+        self.inspector_animation.start()
+
+    def _restore_result_columns(self):
+        for name, widths in getattr(self, '_expanded_column_widths', {}).items():
+            tab = self.result_tables[name]; header = tab.horizontalHeader()
+            header.blockSignals(True)
+            for column, width in enumerate(widths):
+                tab.setColumnWidth(column, width)
+            header.blockSignals(False)
+
+    def copy_inspector_ip(self):
+        if hasattr(self, 'inspector_row'):
+            QApplication.clipboard().setText(self.inspector_row['ip'])
 
     def export_current(self):
         if not self.current_run: return
@@ -418,6 +786,63 @@ class MainWindow(QMainWindow):
         self.worker.completed.connect(self.on_completed)
         self.start_button.setEnabled(False)
         self.worker.start()
+
+    def _running_jobs(self):
+        page, outer = self._page('Running Jobs')
+        outer.addWidget(label('Each organization runs independently. Pause or cancel one without affecting the others.', 'muted'))
+        self.jobs_empty = label('No analyses are running. Add targets in New Analysis to begin.', 'muted')
+        outer.addWidget(self.jobs_empty)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        container = QWidget(); self.jobs_layout = QVBoxLayout(container)
+        self.jobs_layout.setContentsMargins(0, 0, 0, 0)
+        self.jobs_layout.setSpacing(12); self.jobs_layout.addStretch()
+        scroll.setWidget(container); outer.addWidget(scroll, 1)
+        return page
+
+    def _evidence_view(self):
+        page, outer = self._page('Evidence')
+        self.evidence_heading = label('Open a saved analysis to explore its observations.', 'muted')
+        outer.addWidget(self.evidence_heading)
+        self.evidence_search = QLineEdit()
+        self.evidence_search.setPlaceholderText('Search IP, source or observation…')
+        self.evidence_search.textChanged.connect(self.refresh_evidence)
+        outer.addWidget(self.evidence_search)
+        panel = card('panel'); contents = QVBoxLayout(panel)
+        contents.setContentsMargins(10, 10, 10, 10)
+        self.evidence_table = table(['IP', 'Source', 'Observation', 'Points'])
+        self.evidence_table.cellDoubleClicked.connect(self.open_evidence_detail)
+        contents.addWidget(self.evidence_table); outer.addWidget(panel, 1)
+        self.evidence_items = []
+        return page
+
+    def refresh_evidence(self):
+        if not hasattr(self, 'evidence_table'): return
+        if self.current_run is None:
+            runs = [run for run in self.store.runs() if run['status'] != 'RUNNING']
+            if not runs:
+                self.evidence_heading.setText('Open a saved analysis to explore its observations.')
+                fill(self.evidence_table, []); return
+            run_id = runs[0]['id']
+        else:
+            run_id = self.current_run
+        self.evidence_heading.setText(f'Observations from analysis #{run_id}. Double-click a row to inspect the IP.')
+        query = self.evidence_search.text().casefold()
+        self.evidence_items = []
+        for row in self.store.results(run_id):
+            for source, detail, points in row['finding'].get('evidence', []):
+                if query and query not in f'{row["ip"]} {source} {detail}'.casefold():
+                    continue
+                self.evidence_items.append((row, source, detail, points))
+        fill(self.evidence_table, [[row['ip'], source, detail, points]
+                                   for row, source, detail, points in self.evidence_items])
+
+    def open_evidence_detail(self, visual_row, _column):
+        item = self.evidence_table.item(visual_row, 0)
+        if item is None: return
+        row = self.evidence_items[item.data(Qt.UserRole)][0]
+        self.open_run(row['run_id'])
+        self.show_inspector(row)
 
     def _organizations(self):
         page, outer = self._page('Organizations')
@@ -497,7 +922,7 @@ class MainWindow(QMainWindow):
         performance = card('panel')
         form = QFormLayout()
         form.setContentsMargins(22, 20, 22, 20); form.setVerticalSpacing(14)
-        self.theme_box = QComboBox(); self.theme_box.addItems(['Light','Dark'])
+        self.theme_box = QComboBox(); self.theme_box.addItems(['System','Light','Dark'])
         self.theme_box.currentTextChanged.connect(self.apply_theme)
         self.workers_spin = QSpinBox(); self.workers_spin.setRange(1,32); self.workers_spin.setValue(4)
         self.timeout_spin = QSpinBox(); self.timeout_spin.setRange(3,120); self.timeout_spin.setValue(15)
@@ -536,12 +961,23 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self, name):
         self.settings.setValue('theme', name)
-        QApplication.instance().setStyleSheet(DARK if name == 'Dark' else LIGHT)
+        dark = name == 'Dark' or (name == 'System' and self.system_dark)
+        QApplication.instance().setStyleSheet(DARK if dark else LIGHT)
         if hasattr(self, 'theme_box') and self.theme_box.currentText() != name:
             self.theme_box.setCurrentText(name)
 
+    def eventFilter(self, source, event):
+        if (source is QApplication.instance() and
+                event.type() == QEvent.ApplicationPaletteChange and
+                self.settings.value('theme', 'System') == 'System'):
+            dark = QApplication.palette().color(QPalette.Window).lightness() < 128
+            if dark != self.system_dark:
+                self.system_dark = dark
+                QApplication.instance().setStyleSheet(DARK if dark else LIGHT)
+        return super().eventFilter(source, event)
+
     def refresh(self):
-        runs = self.store.runs()
+        runs = [run for run in self.store.runs() if run['status'] != 'RUNNING']
         fill(self.recent, [[r['id'],r['started'][:19],r['status'],r['count']] for r in runs[:10]])
         fill(self.history_table, [[r['id'],r['started'][:19],(r['completed'] or '')[:19],r['status'],r['count']] for r in runs])
         all_rows = [row for run in runs for row in self.store.results(run['id'])]
@@ -556,7 +992,9 @@ class MainWindow(QMainWindow):
             value.setText(str(count))
 
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
+        if (self.worker and self.worker.isRunning()) or any(
+                job['worker'] and not job['finished'] for job in self.jobs.values()):
             QMessageBox.information(self, 'Analysis running', 'Cancel the analysis and wait for it to stop before closing.')
             event.ignore(); return
+        QApplication.instance().removeEventFilter(self)
         super().closeEvent(event)

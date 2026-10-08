@@ -76,8 +76,11 @@ def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, 
                 client_d, cfg, domain, int(cfg.get('censys_history_days', 31)))
         rows = discovery.process_target(target, client_d, None, cfg,
                                         include_known=True, history_lookup=history_lookup)
+        hostnames = {host for row in rows for host in row.get('Discovered_Hostname', '').split(';') if host}
+        emit('candidates', len(rows), len(rows), str(len(hostnames)))
         # The legacy engine filters by canonical ASNs. Defend the boundary again.
         known = {canonical_asn(x) for x in target.get('known_asns', []) if x}
+        verified_count = 0
         for row in rows:
             if cancelled():
                 break
@@ -130,6 +133,8 @@ def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, 
                     'included': status in ('CONFIRMED_OWNED', 'CONFIRMED_LEASED', 'CONFIRMED_OPERATED'),
                 }
                 all_records.append(result)
+                verified_count += 1
+                emit('verified', verified_count, len(rows), ip)
             except Exception as exc:
                 all_records.append({
                     'organization': target['parent_organization'], 'entity': target['target_entity'],
@@ -137,6 +142,8 @@ def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, 
                     'candidate': candidate, 'finding': {'proof': f'Verification failed: {exc}', 'evidence': []},
                     'status': 'ERROR', 'included': False,
                 })
+                verified_count += 1
+                emit('verified', verified_count, len(rows), ip)
     return all_records
 
 

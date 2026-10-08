@@ -1,5 +1,6 @@
 from PySide6.QtCore import QThread, Signal
 import logging
+import threading
 from .engine import analyze
 from .storage import Store
 
@@ -14,9 +15,22 @@ class AnalysisWorker(QThread):
         self.targets = targets
         self.cfg = cfg
         self.cancel_requested = False
+        self._resume = threading.Event()
+        self._resume.set()
 
     def cancel(self):
         self.cancel_requested = True
+        self._resume.set()
+
+    def pause(self):
+        self._resume.clear()
+
+    def resume(self):
+        self._resume.set()
+
+    def _checkpoint(self):
+        self._resume.wait()
+        return self.cancel_requested
 
     def run(self):
         from .credentials import activate
@@ -35,7 +49,7 @@ class AnalysisWorker(QThread):
         status = 'COMPLETED'
         error = ''
         try:
-            records = analyze(self.targets, self.progress.emit, lambda: self.cancel_requested, self.cfg)
+            records = analyze(self.targets, self.progress.emit, self._checkpoint, self.cfg)
             if self.cancel_requested:
                 status = 'CANCELLED'
         except Exception as exc:

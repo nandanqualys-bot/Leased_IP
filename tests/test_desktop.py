@@ -289,3 +289,109 @@ def test_local_config_key_is_used_when_environment_key_missing(monkeypatch):
     monkeypatch.delenv('SHODAN_API_KEY', raising=False)
     monkeypatch.setattr(engine.discovery, 'cfg_load', lambda path: {'shodan_api_key':'local-test-key'})
     assert engine.config()['shodan_api_key']=='local-test-key'
+
+
+def test_import_workspace_choices_preserve_history(app, tmp_path, monkeypatch):
+    import app.window as ui
+    store=Store(tmp_path/'atlas.db')
+    old=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Old','Old','old.example.com','AS64500','']))])
+    newer=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['New','New','new.example.com','AS64501','']))])
+    run=store.start(old); store.finish(run,[])
+    window=MainWindow(store); window.current_targets=list(old); window.show_preview()
+    monkeypatch.setattr(ui.QFileDialog,'getOpenFileName',lambda *a: ('targets.xlsx','Excel'))
+    monkeypatch.setattr(ui,'targets_from_excel',lambda path: newer)
+    selected={'choice':0}
+    class Choice:
+        AcceptRole=0; ActionRole=1; RejectRole=2
+        def __init__(self,*a): self.items=[]
+        def setWindowTitle(self,*a): pass
+        def setText(self,*a): pass
+        def setInformativeText(self,*a): pass
+        def addButton(self,*a):
+            item=object(); self.items.append(item); return item
+        def setDefaultButton(self,item): assert item is self.items[0]
+        def exec(self): pass
+        def clickedButton(self): return self.items[selected['choice']]
+    monkeypatch.setattr(ui,'QMessageBox',Choice)
+    window.import_excel()
+    assert window.current_targets==newer
+    assert len(store.runs())==1
+    selected['choice']=1; window.import_excel()
+    assert window.current_targets==newer*2
+    selected['choice']=2; window.import_excel()
+    assert window.current_targets==newer*2
+    window.clear_workspace()
+    assert window.current_targets==[] and len(store.runs())==1
+    window.close()
+
+
+def test_independent_organization_jobs(app, tmp_path, monkeypatch):
+    import time
+    import app.workers as worker_module
+    store=Store(tmp_path/'atlas.db')
+    window=MainWindow(store)
+    rows=[dict(zip(engine.input_engine.COLUMNS,[name,name,domain,'AS64500','']))
+          for name,domain in [('Alpha','alpha.example.com'),('Bravo','bravo.example.com')]]
+    window.current_targets=engine.normalize_targets(rows)
+    def slow_analysis(targets,emit,cancelled,cfg):
+        for _ in range(30):
+            if cancelled(): break
+            time.sleep(.01)
+        return []
+    monkeypatch.setattr(worker_module,'analyze',slow_analysis)
+    window.start_analysis()
+    assert len(window.jobs)==2
+    first,second=list(window.jobs)
+    window.cancel_job(first)
+    deadline=time.monotonic()+5
+    while not all(job['finished'] for job in window.jobs.values()) and time.monotonic()<deadline:
+        app.processEvents(); time.sleep(.01)
+    assert window.jobs[first]['status']=='Cancelled'
+    assert window.jobs[second]['status']=='Completed'
+    assert {run['status'] for run in store.runs()}=={'CANCELLED','COMPLETED'}
+    for job in window.jobs.values():
+        if job['worker']: assert job['worker'].wait(5000)
+    window.close()
+
+
+def test_inspector_keeps_asset_table_visible(app, tmp_path):
+    store=Store(tmp_path/'atlas.db')
+    target=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Example','Example','example.com','AS64500','']))])
+    run=store.start(target)
+    store.finish(run,[{'organization':'Example','entity':'Example','domains':['example.com'],
+        'ip':'1.1.1.1','hostname':'app.example.com','candidate':{'ip':'1.1.1.1',
+        'origin_asn':'AS13335','discovery_sources':['DNS']},
+        'finding':{'relationship':'Unverified','confidence':'LOW','score':25,
+                   'proof':'Current DNS only','evidence':[('DNS','app.example.com',25)]},
+        'status':'UNVERIFIED','included':False}])
+    window=MainWindow(store); window.show(); window.open_run(run)
+    window.show_inspector(window.current_rows[0]); app.processEvents()
+    assert window.inspector.isVisible()
+    assert window.inspector_ip.text()=='1.1.1.1'
+    assert window.result_tables['Candidates'].isVisible()
+    window.close()
+
+
+def test_pausing_one_worker_does_not_block_another(tmp_path, monkeypatch):
+    import time
+    import app.workers as worker_module
+    targets=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Alpha','Alpha','alpha.example.com','AS64500','']))])
+    other=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Bravo','Bravo','bravo.example.com','AS64500','']))])
+    def work(targets,emit,cancelled,cfg):
+        for _ in range(3):
+            if cancelled(): break
+            time.sleep(.01)
+        return []
+    monkeypatch.setattr(worker_module,'analyze',work)
+    first=AnalysisWorker(tmp_path/'db.sqlite',targets)
+    second=AnalysisWorker(tmp_path/'db.sqlite',other)
+    first.pause(); first.start(); second.start()
+    assert second.wait(5000)
+    assert not first.wait(100)
+    first.resume(); assert first.wait(5000)
+    assert len(Store(tmp_path/'db.sqlite').runs())==2
