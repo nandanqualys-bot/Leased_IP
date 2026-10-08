@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxL
     QLabel, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QLineEdit, QFileDialog, QMessageBox, QTabWidget, QFormLayout, QSpinBox,
     QComboBox, QDialog, QProgressBar, QPlainTextEdit,
-    QAbstractItemView, QApplication, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QScrollArea)
+    QAbstractItemView, QApplication, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QScrollArea, QMenu)
 
 from .engine import input_engine, normalize_targets, targets_from_excel, slug
 from .storage import Store
@@ -17,6 +17,8 @@ from .credentials import presence as credential_presence, save as save_credentia
 from .export import export_results, filename
 from .theme import LIGHT, DARK
 from .motion import NumberLabel, ProgressBar, ScrollbarMotion
+from .controls import RefinedComboBox as QComboBox, FocusSpinBox as QSpinBox
+from .controls import TokenInput, TokenDelegate, SoftSelection
 
 
 def label(text, kind=None):
@@ -91,6 +93,7 @@ def metric(title, value='0', note=''):
 
 def table(columns):
     widget = QTableWidget(0, len(columns))
+    widget.setItemDelegate(SoftSelection(widget))
     widget.setHorizontalHeaderLabels(columns)
     widget.setSelectionBehavior(QAbstractItemView.SelectRows)
     widget.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -231,13 +234,13 @@ class MainWindow(QMainWindow):
         nav.addWidget(self.workspace_label)
         self.stack = QStackedWidget()
         pages = [self._dashboard, self._new_analysis, self._results, self._organizations,
-                 self._history, self._settings, self._running_jobs, self._evidence_view]
+                 self._history, self._settings, self._running_jobs, self._evidence_view, self._exports]
         for method in pages:
             self.stack.addWidget(method())
         self.nav_buttons = []
         self.nav_entries = [('Dashboard', 0, '◈'), ('New Analysis', 1, '+'),
                             ('Running Jobs', 6, '◷'), ('Analysis History', 4, '≡'),
-                            ('Assets', 2, '◆'), ('Evidence', 7, '▤'),
+                            ('Assets', 2, '◆'), ('Evidence', 7, '▤'), ('Exports', 8, '↓'),
                             ('Organizations', 3, '◎'), ('Settings', 5, '⚙')]
         for name, index, icon in self.nav_entries:
             item = button(name, lambda _=False, i=index: self.navigate(i))
@@ -259,6 +262,8 @@ class MainWindow(QMainWindow):
         self.navigate(0)
 
     def navigate(self, index):
+        if index == 8:
+            self.refresh_exports()
         if index == 7:
             self.refresh_evidence()
         self.stack.setCurrentIndex(index)
@@ -330,8 +335,8 @@ class MainWindow(QMainWindow):
         form = QFormLayout()
         form.setContentsMargins(18, 14, 18, 14)
         form.setHorizontalSpacing(22); form.setVerticalSpacing(9)
-        self.parent_name = QLineEdit(); self.entity = QLineEdit(); self.domain = QLineEdit()
-        self.asns = QLineEdit(); self.registrants = QLineEdit()
+        self.parent_name = QLineEdit(); self.entity = QLineEdit(); self.domain = TokenInput()
+        self.asns = TokenInput(); self.registrants = TokenInput()
         for title, widget in [('Parent organization', self.parent_name), ('Target entity', self.entity),
                               ('Target domain(s), ; separated', self.domain), ('Known ASN(s), ; separated', self.asns),
                               ('Registrant names, ; separated', self.registrants)]: form.addRow(title, widget)
@@ -346,6 +351,7 @@ class MainWindow(QMainWindow):
         actions.addStretch(); outer.addLayout(actions)
         outer.addWidget(label('02  /  Review targets', 'sectionTitle'))
         self.preview = table(['Parent organization', 'Target entity', 'Domain', 'Known ASNs', 'Registrant names'])
+        self.preview.setItemDelegate(TokenDelegate(self.preview))
         self.preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         outer.addWidget(self.preview,1)
         self.start_button = button('Run analysis', self.start_analysis, True)
@@ -431,6 +437,12 @@ class MainWindow(QMainWindow):
                          ';'.join(target['target_domains']), ';'.join(target['known_asns']),
                          ';'.join(target['known_registrant_names'])])
         fill(self.preview, rows)
+        for visual_row in range(self.preview.rowCount()):
+            target = self.current_targets[self.preview.item(visual_row,0).data(Qt.UserRole)]
+            for column, key in ((2,'target_domains'), (3,'known_asns'), (4,'known_registrant_names')):
+                item = self.preview.item(visual_row,column)
+                item.setData(Qt.UserRole + 1, target[key])
+                item.setToolTip('\n'.join(target[key]))
 
     def remove_target(self):
         selected = self.preview.currentRow()
@@ -669,7 +681,7 @@ class MainWindow(QMainWindow):
         self.org_filter = QComboBox(); self.org_filter.addItem('All organizations')
         self.org_filter.currentIndexChanged.connect(self.filter_results)
         controls.addWidget(self.org_filter)
-        controls.addWidget(button('Export', self.export_current)); outer.addLayout(controls)
+        outer.addLayout(controls)
         controls.addWidget(button('Reverify selected IP', self.reverify_selected))
         self.tabs = QTabWidget(); self.result_tables = {}
         for title in ('EASM Assets', 'Candidates', 'Shared Infrastructure', 'Rejected', 'Evidence'):
@@ -963,11 +975,127 @@ class MainWindow(QMainWindow):
         actions.addStretch(); outer.addLayout(actions)
         panel = card('panel'); contents = QVBoxLayout(panel)
         contents.setContentsMargins(12, 12, 12, 12)
-        self.history_table = table(['Run', 'Started', 'Completed', 'Status', 'Candidates'])
+        self.history_table = table(['Run', 'Started', 'Completed', 'Status', 'Candidates', 'Organizations'])
         self.history_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         contents.addWidget(self.history_table); outer.addWidget(panel, 1)
         self.history_table.cellDoubleClicked.connect(lambda r,_: self._open_selected_run(self.history_table, r))
         return page
+
+    def history_menu(self, run_id, control):
+        menu = QMenu(self)
+        for organization in sorted({t['parent_organization'] for t in self.store.targets(run_id)}):
+            group = menu.addMenu(organization)
+            group.addAction('Open', lambda name=organization: self.open_organization_run(name, run_id))
+            group.addAction('Export', lambda name=organization: self.export_organization(name, run_id))
+            group.addSeparator()
+            group.addAction('Delete', lambda name=organization: self.delete_organization(name))
+        menu.exec(control.mapToGlobal(control.rect().bottomLeft()))
+
+    def open_organization_run(self, organization, run_id):
+        self.open_run(run_id)
+        if self.org_filter.findText(organization) < 0:
+            self.org_filter.addItem(organization)
+        self.org_filter.setCurrentText(organization)
+
+    def delete_organization(self, organization):
+        active = any(not job['finished'] and job['organization'].casefold() == organization.casefold()
+                     for job in self.jobs.values())
+        if active:
+            QMessageBox.information(self, 'Analysis running', 'Finish or cancel this organization’s jobs before deleting it.')
+            return
+        if self.worker and self.worker.isRunning() and self.worker.target['parent_organization'].casefold() == organization.casefold():
+            QMessageBox.information(self, 'Analysis running', 'Wait for this organization’s verification to finish.')
+            return
+        if not self.confirm_organization_deletion(organization): return
+        try:
+            self.store.delete_organization(organization)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Unable to delete organization', str(exc)); return
+        for job_id, job in list(self.jobs.items()):
+            if job['organization'].casefold() == organization.casefold():
+                if not job.get('retired'):
+                    try:
+                        job['card'].hide(); job['card'].deleteLater()
+                    except RuntimeError:
+                        pass  # Completed cards have already left the view.
+                del self.jobs[job_id]
+        self.current_targets = [t for t in self.current_targets if t['parent_organization'].casefold() != organization.casefold()]
+        self.current_rows = [r for r in self.current_rows if r['organization'].casefold() != organization.casefold()]
+        if self.current_run and not self.store.targets(self.current_run): self.current_run = None
+        self.inspector.hide()
+        self.org_filter.blockSignals(True); self.org_filter.clear(); self.org_filter.addItem('All organizations')
+        self.org_filter.addItems(sorted({r['organization'] for r in self.current_rows})); self.org_filter.blockSignals(False)
+        self.show_preview(); self.filter_results(); self.refresh(); self.refresh_evidence()
+        self.run_heading.setText(f'{len(self.current_rows)} candidates in the current view')
+        self.key_findings.clear()
+        self.statusBar().showMessage(f'Deleted {organization} and its saved analyses permanently')
+
+    def confirm_organization_deletion(self, organization):
+        dialog = QMessageBox(self); dialog.setWindowTitle('Delete organization')
+        dialog.setText(f'Permanently delete {organization}?')
+        dialog.setInformativeText('This removes its analyses, assets and evidence and cannot be undone.')
+        cancel = dialog.addButton('Cancel', QMessageBox.RejectRole)
+        delete = dialog.addButton('Delete', QMessageBox.DestructiveRole)
+        dialog.setDefaultButton(cancel); dialog.setEscapeButton(cancel)
+        dialog.exec()
+        return dialog.clickedButton() is delete
+
+    def _exports(self):
+        page, outer = self._page('Exports')
+        outer.addWidget(label('Export a completed organization directly. Each row shows its latest completed analysis.', 'muted'))
+        panel = card('panel'); contents = QVBoxLayout(panel); contents.setContentsMargins(12,12,12,12)
+        self.exports_table = table(['Organization', 'Last run', 'Verified assets', 'Candidates', 'Status', 'Actions'])
+        contents.addWidget(self.exports_table); outer.addWidget(panel,1)
+        return page
+
+    def refresh_exports(self):
+        if not hasattr(self, 'exports_table'): return
+        summaries = self.store.organization_summaries()
+        fill(self.exports_table, [[r['name'], (r['completed'] or '')[:19], r['assets'], r['candidates'], r['status'], ''] for r in summaries])
+        for visual_row in range(self.exports_table.rowCount()):
+            record = summaries[self.exports_table.item(visual_row,0).data(Qt.UserRole)]
+            control = button('Export', lambda _=False, name=record['name'], run=record['run_id']: self.export_organization(name,run))
+            self.exports_table.setCellWidget(visual_row,5,control)
+
+    def export_organization(self, organization, run_id):
+        from pathlib import Path
+        from .export import OPTIONS
+        run = next((r for r in self.store.runs() if r['id'] == run_id), None)
+        if not run or run['status'] != 'COMPLETED':
+            QMessageBox.information(self, 'Export', 'Exports are available for completed analyses.'); return
+        dialog = QDialog(self); dialog.setWindowTitle(f'Export {organization}')
+        layout = QVBoxLayout(dialog); layout.addWidget(label(organization, 'sectionTitle'))
+        options = QComboBox(); options.addItems(OPTIONS); options.setCurrentText('Export Full Workbook')
+        layout.addWidget(options)
+        layout.addWidget(label('Verified Results contains assets that passed attribution and are included in EASM.', 'muted'))
+        actions = QHBoxLayout(); actions.addWidget(button('Cancel', dialog.reject)); actions.addWidget(button('Export', dialog.accept, True))
+        layout.addLayout(actions)
+        if dialog.exec() != QDialog.Accepted: return
+        suggested = f'{slug(organization)}_EASM_Analysis.xlsx'
+        while True:
+            destination, _ = QFileDialog.getSaveFileName(self, 'Export organization', suggested, 'Excel workbook (*.xlsx)',
+                options=QFileDialog.DontConfirmOverwrite)
+            if not destination: return
+            if not destination.lower().endswith('.xlsx'): destination += '.xlsx'
+            overwrite = False
+            if Path(destination).exists():
+                choice = QMessageBox(self); choice.setWindowTitle('File already exists')
+                choice.setText(f'{Path(destination).name} already exists.')
+                replace = choice.addButton('Replace', QMessageBox.DestructiveRole)
+                save_as = choice.addButton('Save As', QMessageBox.ActionRole)
+                cancel = choice.addButton('Cancel', QMessageBox.RejectRole); choice.setDefaultButton(cancel)
+                choice.exec()
+                if choice.clickedButton() is save_as:
+                    suggested = destination; continue
+                if choice.clickedButton() is not replace: return
+                overwrite = True
+            try:
+                export_results(self.store.results(run_id), destination, mode=options.currentText(),
+                               organization=organization, overwrite=overwrite)
+                self.statusBar().showMessage(f'Exported {organization} to {destination}', 15000)
+            except Exception as exc:
+                QMessageBox.warning(self, 'Export failed', str(exc))
+            return
 
     def _open_selected_run(self, widget, visual_row):
         item = widget.item(visual_row,0)
@@ -1023,44 +1151,113 @@ class MainWindow(QMainWindow):
         outer.addWidget(label('Evidence providers', 'sectionTitle'))
         self.provider_tests = []
         self.credential_inputs = {}
+        self.provider_names = {'Shodan': ('SHODAN_API_KEY',), 'Censys': ('CENSYS_API_TOKEN', 'CENSYS_ORG_ID')}
+        self.provider_labels = {}
+        self.provider_connection = {}
+        self.provider_last_tested = {}
+        self.provider_revision = {'Shodan':0, 'Censys':0}
+        self.credential_show = {}
         for provider, names in [('Shodan', ('SHODAN_API_KEY',)),
                                 ('Censys', ('CENSYS_API_TOKEN', 'CENSYS_ORG_ID'))]:
             panel = card('panel'); contents = QVBoxLayout(panel)
             contents.setContentsMargins(22,20,22,20)
             contents.addWidget(label(provider, 'sectionTitle'))
-            contents.addWidget(label('Configured' if all(credential_presence()[n] for n in names) else 'Not configured', 'muted'))
+            configured = label('', 'muted'); contents.addWidget(configured)
+            self.provider_labels[provider] = configured
             for name in names:
                 entry = QLineEdit(); entry.setEchoMode(QLineEdit.Password)
-                entry.setPlaceholderText('Configured · leave blank to keep' if credential_presence()[name] else 'Enter '+name.replace('_',' ').title())
                 entry.setMinimumWidth(180); self.credential_inputs[name] = entry
+                entry.setAccessibleName(name.replace('_',' ').title())
                 row = QHBoxLayout(); row.addWidget(entry,1)
-                def toggle(_=False, field=entry):
-                    field.setEchoMode(QLineEdit.Normal if field.echoMode() == QLineEdit.Password else QLineEdit.Password)
-                row.addWidget(button('Show / Hide', toggle)); contents.addLayout(row)
-            status = label('Ready to test', 'muted'); contents.addWidget(status)
+                show = button('Show', lambda _=False, key=name: self.toggle_credential(key))
+                self.credential_show[name] = show
+                row.addWidget(show); contents.addLayout(row)
+            status = label(self.settings.value(f'providers/{provider}/connection', 'Not tested'), 'muted')
+            self.provider_connection[provider] = status
+            tested = label('Last tested · ' + self.settings.value(f'providers/{provider}/last_tested', 'Never'), 'muted')
+            self.provider_last_tested[provider] = tested
+            contents.addWidget(tested); contents.addWidget(status)
             test_button = button('Test connection', lambda: None)
             def test(_=False, provider=provider, status=status, control=test_button):
                 from .workers import ProviderTestWorker
-                worker = ProviderTestWorker(provider, {n:f.text() for n,f in self.credential_inputs.items()}, self)
+                if any(not self.credential_inputs[n].isReadOnly() and self.credential_inputs[n].text()
+                       for n in self.provider_names[provider]):
+                    self.statusBar().showMessage('Save the replacement credentials before testing.'); return
+                revision = self.provider_revision[provider]
+                worker = ProviderTestWorker(provider, {}, self)
                 self.provider_tests.append(worker); control.setEnabled(False); status.setText('Connecting…')
-                worker.completed.connect(status.setText)
+                worker.completed.connect(lambda message, p=provider, rev=revision: self.provider_test_finished(p,rev,message))
                 worker.finished.connect(lambda: control.setEnabled(True))
                 worker.start()
             test_button.clicked.connect(test); contents.addWidget(test_button)
-            contents.addWidget(button('Save credentials', self.save_provider_credentials, True))
+            actions = QHBoxLayout()
+            actions.addWidget(button('Replace key', lambda _=False, p=provider: self.replace_provider_key(p)))
+            actions.addWidget(button('Save', lambda _=False, p=provider: self.save_provider_credentials(p), True))
+            contents.addLayout(actions)
             outer.addWidget(panel)
         from .credentials import path, storage_status
-        outer.addWidget(label(f'Credential storage · {path()}\nEncryption · Fernet (local authenticated encryption)\nStatus · {storage_status()}\nLocal database · {self.store.path}', 'muted'))
+        self.storage_label = label('', 'muted'); outer.addWidget(self.storage_label)
+        self.refresh_provider_state()
         outer.addStretch()
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(page)
         return scroll
 
-    def save_provider_credentials(self):
+    def refresh_provider_state(self, reset_names=None):
+        from .credentials import path, storage_status
+        present = credential_presence()
+        for provider, names in self.provider_names.items():
+            self.provider_labels[provider].setText('Configured' if all(present[n] for n in names) else 'Not configured')
+        for name, field in self.credential_inputs.items():
+            if reset_names is not None and name not in reset_names: continue
+            field.clear(); field.setEchoMode(QLineEdit.Password)
+            field.setReadOnly(present[name])
+            field.setPlaceholderText('**********************' if present[name] else 'Enter ' + name.replace('_',' ').title())
+            self.credential_show[name].setText('Show')
+        self.storage_label.setText(f'Credential storage · {path()}\nEncryption · Fernet (local authenticated encryption)\nStatus · {storage_status()}\nLocal database · {self.store.path}')
+
+    def toggle_credential(self, name):
+        field = self.credential_inputs[name]
+        if field.echoMode() == QLineEdit.Normal:
+            field.setEchoMode(QLineEdit.Password)
+            if field.isReadOnly(): field.clear()
+            self.credential_show[name].setText('Show')
+            return
         try:
-            save_credentials({name: field.text() for name, field in self.credential_inputs.items()})
-            for name, field in self.credential_inputs.items():
-                field.clear()
-                field.setPlaceholderText('Configured' if credential_presence()[name] else 'Not configured')
+            if field.isReadOnly():
+                from .credentials import reveal
+                field.setText(reveal(name))
+            field.setEchoMode(QLineEdit.Normal); self.credential_show[name].setText('Hide')
+        except Exception:
+            QMessageBox.warning(self, 'Credential unavailable', 'Unable to decrypt the saved credential. Restore the original local encryption key.')
+
+    def replace_provider_key(self, provider):
+        for name in self.provider_names[provider]:
+            field = self.credential_inputs[name]
+            field.clear(); field.setReadOnly(False); field.setEchoMode(QLineEdit.Password)
+            field.setPlaceholderText('Enter replacement · blank keeps saved value')
+            self.credential_show[name].setText('Show')
+        self.credential_inputs[self.provider_names[provider][0]].setFocus()
+
+    def provider_test_finished(self, provider, revision, message):
+        if revision != self.provider_revision[provider]: return
+        from datetime import datetime
+        tested = datetime.now().astimezone().isoformat(timespec='seconds')
+        self.settings.setValue(f'providers/{provider}/last_tested', tested)
+        self.settings.setValue(f'providers/{provider}/connection', message)
+        self.provider_last_tested[provider].setText('Last tested · ' + tested)
+        self.provider_connection[provider].setText(message)
+
+    def save_provider_credentials(self, provider=None):
+        try:
+            names = self.provider_names[provider] if provider else tuple(self.credential_inputs)
+            updates = {name:self.credential_inputs[name].text() for name in names if not self.credential_inputs[name].isReadOnly()}
+            save_credentials(updates)
+            for p, keys in self.provider_names.items():
+                if any(updates.get(key) for key in keys):
+                    self.provider_revision[p] += 1
+                    self.provider_connection[p].setText('Not tested for current credentials')
+                    self.settings.setValue(f'providers/{p}/connection', 'Not tested for current credentials')
+            self.refresh_provider_state(names)
             self.statusBar().showMessage('Provider settings saved locally')
         except Exception as exc:
             QMessageBox.warning(self, 'Settings error', 'Unable to access encrypted credentials. Check the local storage directory and encryption key.')
@@ -1085,7 +1282,15 @@ class MainWindow(QMainWindow):
     def refresh(self):
         runs = [run for run in self.store.runs() if run['status'] != 'RUNNING']
         fill(self.recent, [[r['id'],r['started'][:19],r['status'],r['count']] for r in runs[:10]])
-        fill(self.history_table, [[r['id'],r['started'][:19],(r['completed'] or '')[:19],r['status'],r['count']] for r in runs])
+        fill(self.history_table, [[r['id'],r['started'][:19],(r['completed'] or '')[:19],r['status'],r['count'],
+            ' · '.join(sorted({t['parent_organization'] for t in self.store.targets(r['id'])}))] for r in runs])
+        for row in range(self.history_table.rowCount()):
+            run_id = int(self.history_table.item(row,0).text())
+            names = self.history_table.item(row,5).text()
+            control = button(names + '  ⋯', lambda: None)
+            control.clicked.connect(lambda _=False, run=run_id, item=control: self.history_menu(run,item))
+            self.history_table.setCellWidget(row,5,control)
+        self.refresh_exports()
         all_rows = [row for run in runs for row in self.store.results(run['id'])]
         included = sum(bool(r['included']) for r in all_rows)
         self.dashboard_summary.setText(f'{len(runs)} analyses · {len(all_rows)} candidates · {included} defensible assets')

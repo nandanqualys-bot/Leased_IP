@@ -95,3 +95,37 @@ class Store:
         with self.connect() as con:
             row = con.execute('SELECT targets_json FROM runs WHERE id=?', (run_id,)).fetchone()
             return json.loads(row[0]) if row else []
+
+    def organization_summaries(self):
+        """Include completed organizations even when discovery returned no IPs."""
+        with self.connect() as con:
+            return [dict(row) for row in con.execute('''
+                SELECT o.id, o.name, r.id AS run_id, r.completed, r.status,
+                    (SELECT count(*) FROM results WHERE run_id=r.id AND org_id=o.id) AS candidates,
+                    (SELECT count(*) FROM results WHERE run_id=r.id AND org_id=o.id AND included=1) AS assets
+                FROM organizations o JOIN runs r ON r.id=(
+                    SELECT max(rt.run_id) FROM run_targets rt JOIN runs rr ON rr.id=rt.run_id
+                    WHERE rt.org_id=o.id AND rr.status='COMPLETED') ORDER BY o.name COLLATE NOCASE''')]
+
+    def delete_organization(self, name):
+        """Atomically remove one organization, preserving shared runs and global data."""
+        with self.connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            org = con.execute('SELECT id FROM organizations WHERE name=? COLLATE NOCASE', (name,)).fetchone()
+            if org is None:
+                return
+            org_id = org['id']
+            runs = con.execute('''SELECT DISTINCT r.* FROM runs r JOIN run_targets t ON t.run_id=r.id
+                                  WHERE t.org_id=?''', (org_id,)).fetchall()
+            if any(run['status'] == 'RUNNING' for run in runs):
+                raise ValueError('Wait for this organization’s running analyses to finish before deleting it.')
+            con.execute('DELETE FROM results WHERE org_id=?', (org_id,))
+            con.execute('DELETE FROM run_targets WHERE org_id=?', (org_id,))
+            for run in runs:
+                remaining = [t for t in json.loads(run['targets_json'])
+                             if t['parent_organization'].casefold() != name.casefold()]
+                if remaining:
+                    con.execute('UPDATE runs SET targets_json=? WHERE id=?', (json.dumps(remaining), run['id']))
+                else:
+                    con.execute('DELETE FROM runs WHERE id=?', (run['id'],))
+            con.execute('DELETE FROM organizations WHERE id=?', (org_id,))

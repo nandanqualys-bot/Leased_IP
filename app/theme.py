@@ -92,6 +92,23 @@ QScrollArea { border: none; background: transparent; }
 LIGHT += CONTROLS
 DARK += CONTROLS
 
+REFINED_CONTROLS = '''
+QComboBox:hover, QSpinBox:hover, QLineEdit:hover { border-color: #9199A5; }
+QComboBox::drop-down { border: none; width: 24px; border-top-right-radius: 9px; border-bottom-right-radius: 9px; }
+QComboBox QAbstractItemView { outline: 0; border: 1px solid #969BA3; border-radius: 10px; padding: 5px; selection-background-color: transparent; }
+QComboBox QAbstractItemView::item { padding: 7px 10px; border-radius: 6px; }
+QMenu { border: 1px solid #969BA3; border-radius: 10px; padding: 6px; }
+QMenu::item { padding: 7px 16px; border-radius: 6px; }
+QMenu::item:selected { background: rgba(124,148,184,65); }
+QCheckBox::indicator, QRadioButton::indicator { width: 14px; height: 14px; border: 1px solid #9299A4; background: transparent; }
+QCheckBox::indicator { border-radius: 4px; }
+QRadioButton::indicator { border-radius: 7px; }
+QCheckBox::indicator:checked, QRadioButton::indicator:checked { background: #8299BA; border: 2px solid #B5C6DD; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color: #7FA9D9; }
+'''
+LIGHT += REFINED_CONTROLS
+DARK += REFINED_CONTROLS
+
 DARK += """
 QPushButton#primary { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #EFEFF1,stop:1 #CDCDCF); color: #202022; border: 1px solid #DADADC; }
 QPushButton#primary:hover { background: #FFFFFF; }

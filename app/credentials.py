@@ -53,6 +53,12 @@ def presence():
         saved = {}
     return {name: bool(os.getenv(name) or saved.get(name)) for name in NAMES}
 
+def reveal(name):
+    """Return the effective credential only when the user explicitly requests Show."""
+    if name not in NAMES:
+        raise ValueError('Unknown provider credential')
+    return os.getenv(name) or _read().get(name) or ''
+
 def activate():
     for name, value in _read().items():
         if value:

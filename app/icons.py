@@ -19,6 +19,9 @@ def navigation_icon(index):
     elif index == 7:
         painter.drawRoundedRect(6,3,12,18,2,2)
         for y in (8,12,16): painter.drawLine(9,y,15,y)
+    elif index == 8:
+        painter.drawLine(12,3,12,15); painter.drawLine(8,11,12,15); painter.drawLine(12,15,16,11)
+        painter.drawLine(4,16,4,20); painter.drawLine(4,20,20,20); painter.drawLine(20,20,20,16)
     elif index == 3:
         painter.drawEllipse(9,3,6,6); painter.drawRoundedRect(5,12,14,8,3,3)
     else:
