@@ -64,6 +64,8 @@ class Store:
             return run_id
 
     def finish(self, run_id, records, status='COMPLETED', error=''):
+        from .credentials import sanitize
+        records, error = sanitize(records), sanitize(error)
         with self.connect() as con:
             for r in records:
                 org_id = con.execute('SELECT id FROM organizations WHERE name=? COLLATE NOCASE',

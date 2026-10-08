@@ -11,6 +11,8 @@ def filename(organization, run_id, suffix):
 
 
 def export_results(rows, destination):
+    from .credentials import sanitize
+    rows = sanitize(rows)
     path = Path(destination)
     payload = []
     evidence = []

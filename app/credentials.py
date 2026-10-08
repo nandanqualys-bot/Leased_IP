@@ -1,47 +1,93 @@
-"""Optional provider settings stored outside the checkout and analysis database."""
+"""Local authenticated encryption; secrets never enter the analysis database."""
 import os
-from pathlib import Path
+import threading
+from cryptography.fernet import Fernet
 from dotenv import dotenv_values
 from .storage import data_dir
 
 NAMES = ('SHODAN_API_KEY', 'CENSYS_API_TOKEN', 'CENSYS_ORG_ID')
-
+_lock = threading.RLock()
 
 def path():
-    return data_dir() / '.env'
+    return data_dir() / 'credentials.enc'
 
-
-def presence():
-    saved = dotenv_values(path()) if path().exists() else {}
-    return {name: bool(os.getenv(name) or saved.get(name)) for name in NAMES}
-
-
-def activate():
-    if path().exists():
-        for name, value in dotenv_values(path()).items():
-            if name in NAMES and value:
-                os.environ.setdefault(name, value)
-
-
-def save(updates):
-    """Blank entries preserve prior values. Never return or log the values."""
-    destination = path()
+def _write(destination, content):
     destination.parent.mkdir(parents=True, exist_ok=True)
-    current = dotenv_values(destination) if destination.exists() else {}
-    for name, value in updates.items():
-        if name in NAMES and value:
-            current[name] = value
-            os.environ[name] = value
-    # Use quote escaping supported by python-dotenv; avoid writing comments or secrets to results.
-    contents = ''.join(f'{name}={_quote(current[name])}\n' for name in NAMES if current.get(name))
-    temporary = destination.with_name(destination.name + '.tmp')
+    temporary = destination.with_suffix(destination.suffix + '.tmp')
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-        handle.write(contents)
+    with os.fdopen(fd, 'wb') as handle:
+        handle.write(content)
     os.replace(temporary, destination)
     if os.name != 'nt':
         os.chmod(destination, 0o600)
 
+def _cipher():
+    key = data_dir() / 'encryption.key'
+    if not key.exists():
+        if path().exists():
+            raise ValueError('Encryption key missing. Restore the local key before using credentials.')
+        _write(key, Fernet.generate_key())
+    return Fernet(key.read_bytes())
 
-def _quote(value):
-    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n') + '"'
+def _read():
+    with _lock:
+        values = {}
+        if path().exists():
+            # A fixed-order, NUL-separated payload avoids plaintext JSON files.
+            values = dict(zip(NAMES, _cipher().decrypt(path().read_bytes()).decode().split(chr(0))))
+        legacy = data_dir() / '.env'
+        if legacy.exists():
+            values = {**{k:v for k,v in dotenv_values(legacy).items() if k in NAMES}, **values}
+            _persist(values)
+            legacy.unlink()
+        return values
+
+def _persist(values):
+    payload = chr(0).join(values.get(name) or '' for name in NAMES).encode()
+    _write(path(), _cipher().encrypt(payload))
+
+def presence():
+    try:
+        saved = _read()
+    except Exception:
+        saved = {}
+    return {name: bool(os.getenv(name) or saved.get(name)) for name in NAMES}
+
+def activate():
+    for name, value in _read().items():
+        if value:
+            os.environ.setdefault(name, value)
+
+def save(updates):
+    with _lock:
+        if any(chr(0) in value for value in updates.values()):
+            raise ValueError('Invalid credential value')
+        current = _read()
+        current.update({k:v for k,v in updates.items() if k in NAMES and v})
+        _persist(current)
+        for name, value in current.items():
+            if value:
+                os.environ[name] = value
+
+def redact(text):
+    for name in NAMES:
+        value = os.getenv(name)
+        if value:
+            text = text.replace(value, '[REDACTED]')
+    return text
+
+
+def storage_status():
+    try:
+        _read()
+        return 'Encrypted' if path().exists() else 'Not configured · encrypted on save'
+    except Exception:
+        return 'Locked · restore the original encryption key and credential file'
+
+
+def sanitize(value):
+    """Redact secret strings before persistence without changing numeric evidence."""
+    if isinstance(value, str): return redact(value)
+    if isinstance(value, dict): return {k:sanitize(v) for k,v in value.items()}
+    if isinstance(value, (list, tuple)): return [sanitize(v) for v in value]
+    return value

@@ -25,10 +25,18 @@ verification = _load('easm_verification', '04_ip_verification.py')
 from .cache import CachedGet
 
 class DiscoveryClient(CachedGet, discovery.HttpClient):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .provider_access import ProviderSession
+        headers = dict(self.s.headers); self.s.close()
+        self.s = ProviderSession(); self.s.headers.update(headers)
 
 class VerificationClient(CachedGet, verification.Client):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from .provider_access import ProviderSession
+        headers = dict(self.s.headers); self.s.close()
+        self.s = ProviderSession(); self.s.headers.update(headers)
 
 
 def canonical_asn(value: str) -> str:
@@ -57,7 +65,7 @@ def config():
     return discovery.cfg_load(ROOT / 'config.json')
 
 
-def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, cfg=None) -> list[dict]:
+def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, cfg=None, on_record=lambda record: None) -> list[dict]:
     """Return verified and excluded records; never write Excel during analysis."""
     cfg = cfg or config()
     client_d = DiscoveryClient(cfg.get('timeouts', {}).get('http', 15), cfg.get('max_retries', 2), cfg.get('request_delay', .2))
@@ -65,7 +73,13 @@ def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, 
     if cfg.get('cache_db'):
         client_d.set_cache(cfg['cache_db'])
         client_v.set_cache(cfg['cache_db'])
-    all_records = []
+    class Records(list):
+        def append(self, record):
+            from .credentials import sanitize
+            record = sanitize(record)
+            super().append(record)
+            on_record(record)
+    all_records = Records()
     for index, target in enumerate(targets, 1):
         if cancelled():
             break
@@ -78,6 +92,13 @@ def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, 
                                         include_known=True, history_lookup=history_lookup)
         hostnames = {host for row in rows for host in row.get('Discovered_Hostname', '').split(';') if host}
         emit('candidates', len(rows), len(rows), str(len(hostnames)))
+        for row in rows:
+            on_record({'organization':target['parent_organization'], 'entity':target['target_entity'],
+                       'domains':target['target_domains'], 'ip':row['IP'],
+                       'hostname':row['Discovered_Hostname'], 'candidate':{'ip':row['IP'],
+                       'origin_asn':row['Origin_ASN'], 'origin_organization':row['Origin_Organization']},
+                       'finding':{'proof':'Discovery complete. Awaiting verification.', 'evidence':[]},
+                       'status':'PENDING', 'included':False})
         # The legacy engine filters by canonical ASNs. Defend the boundary again.
         known = {canonical_asn(x) for x in target.get('known_asns', []) if x}
         verified_count = 0
@@ -139,7 +160,7 @@ def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, 
                 all_records.append({
                     'organization': target['parent_organization'], 'entity': target['target_entity'],
                     'domains': target['target_domains'], 'ip': ip, 'hostname': candidate['hostname'],
-                    'candidate': candidate, 'finding': {'proof': f'Verification failed: {exc}', 'evidence': []},
+                    'candidate': candidate, 'finding': {'proof': 'Verification failed; provider request could not be completed.', 'evidence': []},
                     'status': 'ERROR', 'included': False,
                 })
                 verified_count += 1

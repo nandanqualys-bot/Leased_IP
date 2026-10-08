@@ -43,7 +43,9 @@ def test_known_asn_is_excluded_before_verification(monkeypatch):
         calls.append(c['ip'])
         return {'confidence':'LOW','relationship':'Unverified','score':30,'evidence':[], 'proof':'Weak evidence'}
     monkeypatch.setattr(engine.verification, 'score_candidate', verify)
-    results = engine.analyze(targets)
+    streamed = []
+    results = engine.analyze(targets, on_record=streamed.append)
+    assert [r['status'] for r in streamed] == ['PENDING','PENDING','KNOWN_ASN_EXCLUDED','UNVERIFIED']
     assert [r['status'] for r in results] == ['KNOWN_ASN_EXCLUDED','UNVERIFIED']
     assert calls == ['8.8.8.8']
     assert not any(r['included'] for r in results)
@@ -77,7 +79,7 @@ def test_storage_reopen_export_and_ui(app, tmp_path):
 def test_worker_runs_off_ui_thread(app, tmp_path, monkeypatch):
     targets=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
         ['Example','Example','example.com','AS64500','']))])
-    monkeypatch.setattr('app.workers.analyze', lambda *a: [])
+    monkeypatch.setattr('app.workers.analyze', lambda *a, **kw: [])
     worker=AnalysisWorker(tmp_path/'db.sqlite',targets)
     worker.start(); assert worker.wait(5000)
     assert Store(tmp_path/'db.sqlite').runs()[0]['status']=='COMPLETED'
@@ -86,9 +88,9 @@ def test_worker_runs_off_ui_thread(app, tmp_path, monkeypatch):
 def test_direct_sample_analysis_persists(app, tmp_path, monkeypatch):
     """Exercise real discovery/score functions with controlled provider observations."""
     d=engine.discovery; v=engine.verification
-    monkeypatch.setattr(d,'crtsh',lambda *a: [])
+    monkeypatch.setattr(d,'crtsh',lambda *a, **kw: [])
     monkeypatch.setattr(d,'official_site_discovery',lambda *a: ([],[]))
-    monkeypatch.setattr(d,'dns_cnames',lambda *a: [])
+    monkeypatch.setattr(d,'dns_cnames',lambda *a, **kw: [])
     monkeypatch.setattr(d,'dns_resolve',lambda *a: [('1.1.1.1','A','DNS'),('8.8.8.8','A','DNS')])
     monkeypatch.setattr(d,'ripestat_network_info',lambda client,ip: {'asns':[27385 if ip=='8.8.8.8' else 13335]})
     monkeypatch.setattr(d,'ripestat_as_overview',lambda *a: {'holder':'Provider'})
@@ -98,7 +100,7 @@ def test_direct_sample_analysis_persists(app, tmp_path, monkeypatch):
     monkeypatch.setattr(v,'ptr',lambda *a: '')
     monkeypatch.setattr(v,'resolve',lambda *a: ['1.1.1.1'])
     monkeypatch.setattr(v,'tls',lambda *a: {})
-    monkeypatch.setattr(v,'crt_assoc',lambda *a: [])
+    monkeypatch.setattr(v,'crt_assoc',lambda *a, **kw: [])
     monkeypatch.setattr(v,'shodan',lambda *a: {})
     targets=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
         ['Example','Example','example.com','27385','Example']))])
@@ -115,7 +117,8 @@ def test_provider_settings_are_private_and_masked(app, tmp_path, monkeypatch):
     monkeypatch.setenv('EASM_DATA_DIR',str(tmp_path))
     from app import credentials
     credentials.save({'SHODAN_API_KEY':'example-test-value'})
-    assert credentials.path().read_text().find('example-test-value') >= 0
+    assert b'example-test-value' not in credentials.path().read_bytes()
+    assert credentials._read()['SHODAN_API_KEY'] == 'example-test-value'
     if os.name != 'nt': assert credentials.path().stat().st_mode & 0o077 == 0
     assert credentials.presence()['SHODAN_API_KEY']
     window=MainWindow(Store(tmp_path/'database.sqlite'))
@@ -207,10 +210,10 @@ def test_shodan_hostname_search_adds_only_in_scope_public_ipv4(monkeypatch):
 
 def test_new_candidate_sources_keep_known_asn_filter(monkeypatch):
     d=engine.discovery
-    monkeypatch.setattr(d,'crtsh',lambda *a: [])
+    monkeypatch.setattr(d,'crtsh',lambda *a, **kw: [])
     monkeypatch.setattr(d,'official_site_discovery',lambda *a: ([],[]))
-    monkeypatch.setattr(d,'dns_cnames',lambda *a: [])
-    monkeypatch.setattr(d,'dns_resolve',lambda *a: [])
+    monkeypatch.setattr(d,'dns_cnames',lambda *a, **kw: [])
+    monkeypatch.setattr(d,'dns_resolve',lambda *a, **kw: [])
     monkeypatch.setattr(d,'shodan_domain_candidates',lambda *a: [('1.1.1.1',['app.example.com'])])
     monkeypatch.setattr(d,'ripestat_network_info',lambda client,ip: {'asns':[27385 if ip=='1.1.1.1' else 13335]})
     monkeypatch.setattr(d,'ripestat_as_overview',lambda *a: {'holder':'Provider'})
@@ -246,7 +249,7 @@ def test_cloud_rdap_does_not_cancel_live_dns_and_tls(monkeypatch):
     monkeypatch.setattr(v,'ptr',lambda *a: '')
     monkeypatch.setattr(v,'resolve',lambda *a: ['1.1.1.1'])
     monkeypatch.setattr(v,'tls',lambda *a: {'cn':'app.example.com','sans':['app.example.com']})
-    monkeypatch.setattr(v,'crt_assoc',lambda *a: [])
+    monkeypatch.setattr(v,'crt_assoc',lambda *a, **kw: [])
     monkeypatch.setattr(v,'shodan',lambda *a: {})
     target={'parent_organization':'Example','target_entity':'Example','target_domains':['example.com'],
             'known_asns':['AS64500'],'known_registrant_names':[]}
@@ -335,7 +338,7 @@ def test_independent_organization_jobs(app, tmp_path, monkeypatch):
     rows=[dict(zip(engine.input_engine.COLUMNS,[name,name,domain,'AS64500','']))
           for name,domain in [('Alpha','alpha.example.com'),('Bravo','bravo.example.com')]]
     window.current_targets=engine.normalize_targets(rows)
-    def slow_analysis(targets,emit,cancelled,cfg):
+    def slow_analysis(targets,emit,cancelled,cfg, **kwargs):
         for _ in range(30):
             if cancelled(): break
             time.sleep(.01)
@@ -382,7 +385,7 @@ def test_pausing_one_worker_does_not_block_another(tmp_path, monkeypatch):
         ['Alpha','Alpha','alpha.example.com','AS64500','']))])
     other=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
         ['Bravo','Bravo','bravo.example.com','AS64500','']))])
-    def work(targets,emit,cancelled,cfg):
+    def work(targets,emit,cancelled,cfg, **kwargs):
         for _ in range(3):
             if cancelled(): break
             time.sleep(.01)
@@ -395,3 +398,93 @@ def test_pausing_one_worker_does_not_block_another(tmp_path, monkeypatch):
     assert not first.wait(100)
     first.resume(); assert first.wait(5000)
     assert len(Store(tmp_path/'db.sqlite').runs())==2
+
+
+def test_encrypted_credentials_migrate_and_detect_tampering(tmp_path, monkeypatch):
+    from app import credentials
+    from cryptography.fernet import InvalidToken
+    monkeypatch.setenv('EASM_DATA_DIR', str(tmp_path))
+    (tmp_path/'.env').write_text('SHODAN_API_KEY=migration-test-secret\n')
+    assert credentials._read()['SHODAN_API_KEY'] == 'migration-test-secret'
+    assert not (tmp_path/'.env').exists()
+    assert b'migration-test-secret' not in credentials.path().read_bytes()
+    credentials.save({'CENSYS_API_TOKEN':'second-secret'})
+    credentials.save({'SHODAN_API_KEY':''})
+    assert credentials._read()['SHODAN_API_KEY'] == 'migration-test-secret'
+    token = bytearray(credentials.path().read_bytes()); token[30] ^= 1
+    credentials.path().write_bytes(token)
+    with pytest.raises(InvalidToken): credentials._read()
+
+
+def test_authenticated_provider_requests_never_redirect(monkeypatch):
+    from app.provider_access import ProviderSession
+    import requests
+    seen = []
+    monkeypatch.setattr(requests.Session, 'request', lambda self,method,url,**kw: seen.append((url,kw)))
+    client = ProviderSession()
+    client.get('https://api.shodan.io/api-info', params={'key':'test-secret'})
+    assert seen[0][1]['allow_redirects'] is False
+    with pytest.raises(ValueError):
+        client.get('https://example.com/', params={'key':'test-secret'})
+    with pytest.raises(ValueError):
+        client.get('http://api.shodan.io/', params={'key':'test-secret'})
+    assert len(seen) == 1
+
+
+def test_live_candidate_replaced_and_saved_run_stays_selected(app, tmp_path):
+    from app.window import JobCard
+    window = MainWindow(Store(tmp_path/'atlas.db'))
+    card = JobCard('Example',lambda:None,lambda:None,lambda:None)
+    window.jobs[1] = {'records':[], 'card':card, 'hostnames':1, 'candidates':1}
+    pending = {'organization':'Example','entity':'Example','domains':['example.com'],
+               'ip':'1.1.1.1','hostname':'example.com','candidate':{},
+               'finding':{'evidence':[]},'included':False,'status':'PENDING'}
+    window.on_live_record(1,pending); window.flush_live_results()
+    assert len(window.current_rows) == 1
+    assert window.visible_rows['Rejected'] == []
+    final = {**pending, 'status':'CONFIRMED_LEASED','included':True}
+    window.on_live_record(1,final); window.flush_live_results()
+    assert len(window.current_rows) == 1 and window.current_rows[0]['included']
+    window.current_run = 99
+    window.on_live_record(1,{**final,'ip':'8.8.8.8'}); window.flush_live_results()
+    assert window.current_run == 99 and len(window.current_rows) == 1
+    window.clear_workspace(); window.flush_live_results()
+    assert window.current_rows == []
+    window.jobs.clear(); window.close(); card.deleteLater()
+
+
+def test_live_records_survive_worker_failure(app, tmp_path, monkeypatch):
+    import app.workers as worker_module
+    targets=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Example','Example','example.com','AS64500','']))])
+    row={'organization':'Example','entity':'Example','domains':['example.com'],
+         'ip':'1.1.1.1','hostname':'example.com','candidate':{},'finding':{},
+         'status':'UNVERIFIED','included':False}
+    def interrupted(*args, on_record):
+        on_record(row)
+        raise RuntimeError('sensitive-request-URL')
+    monkeypatch.setattr(worker_module,'analyze',interrupted)
+    worker=AnalysisWorker(tmp_path/'atlas.db', targets)
+    worker.start(); assert worker.wait(5000)
+    store=Store(tmp_path/'atlas.db')
+    assert store.runs()[0]['status'] == 'FAILED'
+    assert store.results(1)[0]['ip'] == '1.1.1.1'
+    assert 'sensitive-request-URL' not in store.runs()[0]['error']
+
+
+def test_secret_redaction_at_persistence_and_export(tmp_path, monkeypatch):
+    from app.export import export_results
+    secret = 'key-with-"quoted"-content'
+    monkeypatch.setenv('SHODAN_API_KEY',secret)
+    targets=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Example','Example','example.com','AS64500','']))])
+    store=Store(tmp_path/'atlas.db'); run=store.start(targets)
+    row={'organization':'Example','entity':'Example','domains':['example.com'],
+         'ip':'1.1.1.1','hostname':'example.com','candidate':{},
+         'finding':{'proof':secret,'evidence':[('Provider',secret,0)]},
+         'status':'UNVERIFIED','included':False}
+    store.finish(run,[row])
+    assert store.results(run)[0]['finding']['proof'] == '[REDACTED]'
+    export_results([row],tmp_path/'export.json')
+    import json
+    assert json.loads((tmp_path/'export.json').read_text())['results'][0]['Proof Summary'] == '[REDACTED]'

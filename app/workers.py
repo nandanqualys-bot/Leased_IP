@@ -6,6 +6,8 @@ from .storage import Store
 
 
 class AnalysisWorker(QThread):
+    record_ready = Signal(object)
+    log_entry = Signal(str)
     progress = Signal(str, int, int, str)
     completed = Signal(int, str, str)
 
@@ -34,12 +36,13 @@ class AnalysisWorker(QThread):
 
     def run(self):
         from .credentials import activate
-        activate()
         store = Store(self.db_path)
-        log_path = store.path.parent / 'atlas.log'
-        logger = logging.getLogger('atlas.desktop')
+        from logging.handlers import RotatingFileHandler
+        log_path = store.path.parent / 'logs' / 'atlas.log'
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger('atlas.desktop.' + str(store.path.resolve()))
         if not logger.handlers:
-            handler = logging.FileHandler(log_path, encoding='utf-8')
+            handler = RotatingFileHandler(log_path, maxBytes=2_000_000, backupCount=3, encoding='utf-8')
             handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
             logger.addHandler(handler)
             logger.setLevel(logging.INFO)
@@ -49,15 +52,38 @@ class AnalysisWorker(QThread):
         status = 'COMPLETED'
         error = ''
         try:
-            records = analyze(self.targets, self.progress.emit, self._checkpoint, self.cfg)
+            activate()
+            def progress(stage, current, total, item):
+                self.progress.emit(stage, current, total, item)
+                message = f'INFO {stage.title()} · {current}/{total} · {item}'
+                self.log_entry.emit(message)
+                logger.info('Analysis %s %s', run_id, message)
+            def record_ready(record):
+                key = (record['organization'], record['entity'], record['ip'], record['hostname'])
+                position = next((i for i,r in enumerate(records) if
+                    (r['organization'],r['entity'],r['ip'],r['hostname']) == key), None)
+                if position is None: records.append(record)
+                else: records[position] = record
+                self.record_ready.emit(record)
+                message = (f"INFO Discovered {record['ip']} · awaiting verification" if record['status'] == 'PENDING' else
+                           f"INFO Candidate {record['ip']} classified {record['status']} · proof generated")
+                self.log_entry.emit(message)
+                logger.info('Analysis %s %s', run_id, message)
+                for source, detail, points in record['finding'].get('evidence', []):
+                    self.log_entry.emit(f'DEBUG {source} evidence recorded · {points:+} points')
+                if record['status'] in ('ERROR', 'UNVERIFIED'):
+                    self.log_entry.emit('WARNING Candidate has insufficient evidence for inclusion')
+            analyze(self.targets, progress, self._checkpoint, self.cfg, on_record=record_ready)
             if self.cancel_requested:
                 status = 'CANCELLED'
         except Exception as exc:
             status = 'FAILED'
-            error = str(exc)
-            logger.exception('Analysis %s failed', run_id)
+            error = 'Analysis failed. Check provider availability and target configuration.'
+            logger.error('Analysis %s failed (%s)', run_id, type(exc).__name__)
+            self.log_entry.emit('ERROR ' + error)
         store.finish(run_id, records, status, error)
         logger.info('Analysis %s %s (%s results)', run_id, status, len(records))
+        self.log_entry.emit(f'INFO Analysis {status.lower()} · {len(records)} candidates')
         self.completed.emit(run_id, status, error)
 
 
@@ -76,12 +102,12 @@ class ReverifyWorker(QThread):
     def run(self):
         from .engine import verification, classify, config, canonical_asn, VerificationClient
         from .credentials import activate
-        activate()
         store = Store(self.db_path)
         run_id = store.start([self.target])
         records = []
         status, error = 'COMPLETED', ''
         try:
+            activate()
             candidate = dict(self.previous['candidate'])
             self.progress.emit('reverification', 1, 1, candidate['ip'])
             effective_config = self.cfg or config()
@@ -108,6 +134,40 @@ class ReverifyWorker(QThread):
                 'included': classification in ('CONFIRMED_OWNED','CONFIRMED_LEASED','CONFIRMED_OPERATED'),
             }]
         except Exception as exc:
-            status, error = 'FAILED', str(exc)
+            status, error = 'FAILED', 'Reverification failed. Check provider availability.'
         store.finish(run_id, records, status, error)
         self.completed.emit(run_id, status, error)
+
+
+class ProviderTestWorker(QThread):
+    completed = Signal(str)
+
+    def __init__(self, provider, values, parent=None):
+        super().__init__(parent)
+        self.provider, self.values = provider, values
+
+    def run(self):
+        from .credentials import activate, NAMES
+        from .provider_access import ProviderSession
+        import os
+        try:
+            activate()
+            values = {n: self.values.get(n) or os.getenv(n, '') for n in NAMES}
+            with ProviderSession() as session:
+                if self.provider == 'Shodan':
+                    if not values['SHODAN_API_KEY']:
+                        self.completed.emit('Enter an API key first'); return
+                    response = session.get('https://api.shodan.io/api-info',
+                        params={'key': values['SHODAN_API_KEY']}, timeout=15)
+                else:
+                    if not values['CENSYS_API_TOKEN'] or not values['CENSYS_ORG_ID']:
+                        self.completed.emit('Enter a token and organization ID first'); return
+                    response = session.get('https://api.platform.censys.io/v3/global/asset/host/1.1.1.1',
+                        headers={'Authorization':'Bearer '+values['CENSYS_API_TOKEN']},
+                        params={'organization_id':values['CENSYS_ORG_ID']}, timeout=15)
+                self.completed.emit('Connection verified' if response.status_code == 200 else
+                                    f'Provider returned HTTP {response.status_code}; check credentials and account access')
+        except Exception:
+            self.completed.emit('Connection unavailable; check network and provider access')
+        finally:
+            self.values.clear()
