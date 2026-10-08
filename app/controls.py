@@ -1,8 +1,9 @@
 """Refined controls that preserve the existing layout and input contracts."""
-from PySide6.QtCore import Qt, QVariantAnimation, QEasingCurve, QRectF
-from PySide6.QtGui import QColor, QPainter, QPalette
+from PySide6.QtCore import Qt, QVariantAnimation, QEasingCurve, QRectF, Signal
+from PySide6.QtGui import QColor, QPainter, QPalette, QBrush
 from PySide6.QtWidgets import (QComboBox, QSpinBox, QLineEdit, QStyledItemDelegate,
                               QStyle, QStyleOptionFrame)
+import re
 
 
 class FocusSpinBox(QSpinBox):
@@ -44,6 +45,10 @@ class SoftSelection(QStyledItemDelegate):
             painter.drawRoundedRect(QRectF(option.rect).adjusted(2, 2, -2, -2), 6, 6)
             painter.restore()
             option.state &= ~(QStyle.State_Selected | QStyle.State_MouseOver)
+            option.backgroundBrush=QBrush(Qt.NoBrush)
+            text=option.palette.color(QPalette.Text)
+            option.palette.setColor(QPalette.Highlight,text)
+            option.palette.setColor(QPalette.HighlightedText,text)
         super().paint(painter, option, index)
 
 
@@ -91,10 +96,35 @@ def paint_tokens(painter, rect, values, color):
 
 class TokenInput(QLineEdit):
     """Semicolon editing on focus; tokens and a full tooltip when browsing."""
-    def __init__(self, *args):
+    valuesChanged = Signal(list)
+    def __init__(self, *args, comma_separator=True):
         super().__init__(*args)
-        self.setPlaceholderText('Enter values separated by ;')
-        self.textChanged.connect(lambda text: self.setToolTip('\n'.join(v.strip() for v in text.split(';') if v.strip())))
+        self.comma_separator = comma_separator
+        self.setPlaceholderText('Enter a value and press Enter')
+        self.returnPressed.connect(self.commit_values)
+        self.textChanged.connect(lambda _text: self.update())
+
+    def values(self):
+        pattern=r'[,;\n\r]+' if self.comma_separator else r'[;\n\r]+'
+        return list(dict.fromkeys(v.strip() for v in re.split(pattern,self.text()) if v.strip()))
+
+    def commit_values(self):
+        values = self.values(); self.blockSignals(True); self.setText('; '.join(values)); self.blockSignals(False)
+        self.setToolTip('\n'.join(values)); self.valuesChanged.emit(values); self.update()
+
+    def focusOutEvent(self,event):
+        self.commit_values(); super().focusOutEvent(event)
+
+    def mousePressEvent(self,event):
+        if not self.hasFocus():
+            values=self.values(); x=10
+            for position,value in enumerate(values):
+                width=self.fontMetrics().horizontalAdvance(value)+34
+                if x <= event.position().x() <= x+width and event.position().x() >= x+width-17:
+                    values.pop(position); self.setText('; '.join(values)); self.setToolTip('\n'.join(values))
+                    event.accept(); return
+                x += width+5
+        super().mousePressEvent(event)
 
     def paintEvent(self, event):
         if self.hasFocus() or not self.text():
@@ -102,8 +132,7 @@ class TokenInput(QLineEdit):
         painter = QPainter(self)
         option = QStyleOptionFrame(); self.initStyleOption(option)
         self.style().drawPrimitive(QStyle.PE_PanelLineEdit, option, painter, self)
-        paint_tokens(painter, self.rect().adjusted(5,0,-5,0),
-                     [v.strip() for v in self.text().split(';') if v.strip()], self.palette().color(QPalette.Text))
+        paint_tokens(painter, self.rect().adjusted(5,0,-5,0), self.values(), self.palette().color(QPalette.Text))
 
 
 class TokenDelegate(SoftSelection):

@@ -48,6 +48,9 @@ def canonical_asn(value: str) -> str:
 
 def normalize_targets(rows: list[dict]) -> list[dict]:
     frame = pd.DataFrame(rows, columns=input_engine.COLUMNS).fillna('')
+    for column in ('Target_Domain', 'Known_Target_ASNs'):
+        frame[column] = frame[column].map(lambda value: re.sub(r'[,\n\r]+', ';', str(value or '')))
+    frame['Known_Registrant_Names'] = frame['Known_Registrant_Names'].map(lambda value: re.sub(r'[\n\r]+', ';', str(value or '')))
     frame = input_engine.validate_rows(frame)
     return input_engine.to_json(frame)['targets']
 

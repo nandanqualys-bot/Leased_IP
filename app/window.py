@@ -1,18 +1,19 @@
 """Qt desktop shell, target workflow, history, results, and evidence inspection."""
 from __future__ import annotations
 import time
+import json
 
-from PySide6.QtCore import Qt, QSettings, QTimer, QPropertyAnimation, QEasingCurve, QEvent, QSize
+from PySide6.QtCore import Qt, QSettings, QTimer, QPropertyAnimation, QEasingCurve, QEvent, QSize, QVariantAnimation, Signal
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QLineEdit, QFileDialog, QMessageBox, QTabWidget, QFormLayout, QSpinBox,
     QComboBox, QDialog, QProgressBar, QPlainTextEdit,
-    QAbstractItemView, QApplication, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QScrollArea, QMenu)
+    QAbstractItemView, QApplication, QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QScrollArea, QMenu, QHeaderView)
 
 from .engine import input_engine, normalize_targets, targets_from_excel, slug
 from .storage import Store
-from .workers import AnalysisWorker, ReverifyWorker
+from .workers import AnalysisWorker, ReverifyWorker, ExportWorker
 from .credentials import presence as credential_presence, save as save_credentials
 from .export import export_results, filename
 from .theme import LIGHT, DARK
@@ -193,6 +194,9 @@ class JobCard(QFrame):
 
 
 class MainWindow(QMainWindow):
+    organization_deleted = Signal(str)
+    analysis_deleted = Signal(int)
+
     def __init__(self, store=None):
         super().__init__()
         self.store = store or Store()
@@ -204,11 +208,14 @@ class MainWindow(QMainWindow):
         self.jobs = {}
         self.pending_jobs = []
         self.next_job_id = 1
+        self.export_workers = []
         self.system_dark = QApplication.palette().color(QPalette.Window).lightness() < 128
         self.setWindowTitle('Atlas EASM · Off-ASN intelligence')
         self.setMinimumSize(980, 620)
         self.resize(1360, 820)
         self._build()
+        self.organization_deleted.connect(self.on_organization_deleted)
+        self.analysis_deleted.connect(self.on_analysis_deleted)
         QApplication.instance().installEventFilter(self)
         self.apply_theme(self.settings.value('theme', 'System'))
         self.refresh()
@@ -222,7 +229,7 @@ class MainWindow(QMainWindow):
         nav = QVBoxLayout(sidebar); nav.setContentsMargins(20,30,20,22); nav.setSpacing(8)
         self.nav_layout = nav
         brand_row = QHBoxLayout()
-        self.brand_label = label('◈  ATLAS', 'brand'); brand_row.addWidget(self.brand_label, 1)
+        self.brand_label = label('◈  Atlas EASM', 'brand'); brand_row.addWidget(self.brand_label, 1)
         self.collapse_button = button('‹', self.toggle_sidebar)
         self.collapse_button.setToolTip('Collapse sidebar')
         self.collapse_button.setFixedWidth(34); brand_row.addWidget(self.collapse_button)
@@ -318,17 +325,48 @@ class MainWindow(QMainWindow):
             metrics.addWidget(tile); self.dashboard_numbers.append(value)
         outer.addLayout(metrics)
         self.dashboard_summary = label(''); self.dashboard_summary.hide(); outer.addWidget(self.dashboard_summary)
-        outer.addWidget(label('Recent analyses', 'sectionTitle'))
+        recent_header = QHBoxLayout()
+        recent_header.addWidget(label('Recent analyses', 'sectionTitle')); recent_header.addStretch()
+        self.recent_expand = button('Expand  ⌄', self.toggle_recent_analyses)
+        recent_header.addWidget(self.recent_expand); outer.addLayout(recent_header)
         recent_panel = card('panel'); recent_layout = QVBoxLayout(recent_panel)
         recent_layout.setContentsMargins(12, 12, 12, 12)
-        self.recent = table(['Run', 'Started', 'Status', 'Candidates']); recent_layout.addWidget(self.recent)
-        outer.addWidget(recent_panel, 1)
+        self.recent = table(['Organization', 'Target / Entity', 'Analysis date', 'Status', 'Candidates', 'Verified assets'])
+        for column in (0,2,3,4,5): self.recent.horizontalHeader().setSectionResizeMode(column,QHeaderView.ResizeToContents)
+        self.recent.horizontalHeader().setSectionResizeMode(1,QHeaderView.Stretch)
+        self.recent.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recent.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.recent.setMinimumHeight(0); recent_layout.addWidget(self.recent)
+        self.recent_more = button('Load 10 more', self.load_more_recent); recent_layout.addWidget(self.recent_more,0,Qt.AlignRight)
+        self.recent_more.hide(); self.recent_expanded = False; self.recent_limit = 3
+        self.recent_animation = QVariantAnimation(self); self.recent_animation.setDuration(200)
+        self.recent_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.recent_animation.valueChanged.connect(lambda height: recent_panel.setMaximumHeight(round(height)))
+        self.recent_animation.valueChanged.connect(lambda height: recent_panel.setMinimumHeight(round(height)))
+        self.recent_panel = recent_panel; recent_panel.setMaximumHeight(260); outer.addWidget(recent_panel)
         self.recent.cellDoubleClicked.connect(lambda r,_: self._open_selected_run(self.recent, r))
-        return page
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame); scroll.setWidget(page)
+        return scroll
+
+    def toggle_recent_analyses(self):
+        previous=self.recent_panel.height() or 260
+        self.recent_expanded = not self.recent_expanded
+        self.recent_limit = 10 if self.recent_expanded else 3
+        self.recent_expand.setText('Collapse  ⌃' if self.recent_expanded else 'Expand  ⌄')
+        self.recent_more.setVisible(self.recent_expanded); self.refresh_recent()
+        target=128+max(3,self.recent.rowCount())*42+(40 if self.recent_expanded else 0)
+        target=max(260,target) if self.recent_expanded else 260
+        self.recent_panel.setMinimumHeight(0)
+        self.recent_animation.stop(); self.recent_animation.setStartValue(previous)
+        self.recent_animation.setEndValue(target); self.recent_animation.start()
+
+    def load_more_recent(self):
+        self.recent_limit = min(self.recent_limit + 10, 100); self.refresh_recent()
 
     def _new_analysis(self):
         page, outer = self._page('New analysis')
         outer.setContentsMargins(24, 20, 24, 20); outer.setSpacing(11)
+        self.validation_banner = label('', 'validationBanner'); self.validation_banner.hide(); outer.addWidget(self.validation_banner)
         outer.addWidget(label('Define the organizations and domains you are authorized to assess.', 'muted'))
         outer.addWidget(label('01  /  Target information', 'sectionTitle'))
         form_panel = card('panel')
@@ -336,10 +374,10 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(18, 14, 18, 14)
         form.setHorizontalSpacing(22); form.setVerticalSpacing(9)
         self.parent_name = QLineEdit(); self.entity = QLineEdit(); self.domain = TokenInput()
-        self.asns = TokenInput(); self.registrants = TokenInput()
+        self.asns = TokenInput(); self.registrants = TokenInput(comma_separator=False)
         for title, widget in [('Parent organization', self.parent_name), ('Target entity', self.entity),
-                              ('Target domain(s), ; separated', self.domain), ('Known ASN(s), ; separated', self.asns),
-                              ('Registrant names, ; separated', self.registrants)]: form.addRow(title, widget)
+                              ('Target domains', self.domain), ('Known ASNs', self.asns),
+                              ('Registrant names', self.registrants)]: form.addRow(title, widget)
         form_panel.setLayout(form); outer.addWidget(form_panel)
         actions = QHBoxLayout()
         actions.addWidget(button('Add target', self.add_manual, True))
@@ -377,12 +415,58 @@ class MainWindow(QMainWindow):
     def add_manual(self):
         row = dict(zip(input_engine.COLUMNS, [self.parent_name.text(), self.entity.text(),
                   self.domain.text(), self.asns.text(), self.registrants.text()]))
+        targets, warnings = self._validated_target_rows([row])
+        if targets:
+            try:
+                self.current_targets = normalize_targets(self.current_targets + targets)
+            except ValueError as exc:
+                warnings.append(str(exc))
+            else:
+                self.show_preview()
+                for widget in (self.parent_name, self.entity, self.domain, self.asns, self.registrants): widget.clear()
+        self.show_validation_summary(warnings)
+
+    @staticmethod
+    def _validated_target_rows(rows):
+        import re
+        normalized, warnings = [], []
+        for number, raw in enumerate(rows, 1):
+            parent = input_engine.norm_text(raw.get('Parent_Organization', ''))
+            entity = input_engine.norm_text(raw.get('Target_Entity', '')) or parent
+            raw_domains = [v.strip() for v in re.split(r'[,;\n\r]+', str(raw.get('Target_Domain', ''))) if v.strip()]
+            raw_asns = [v.strip() for v in re.split(r'[,;\n\r]+', str(raw.get('Known_Target_ASNs', ''))) if v.strip()]
+            registrants = [v.strip() for v in re.split(r'[;\n\r]+', str(raw.get('Known_Registrant_Names', ''))) if v.strip()]
+            domains, asns = [], []
+            for value in raw_domains:
+                domain = input_engine.normalize_domain(value)
+                if '://' in value or '/' in value or not input_engine.DOMAIN_RE.fullmatch(domain):
+                    warnings.append(f'Target domains · “{value}” is invalid and was excluded.')
+                elif domain not in domains:
+                    domains.append(domain)
+            for value in raw_asns:
+                asn = input_engine.normalize_asn(value)
+                if not input_engine.ASN_RE.fullmatch(asn):
+                    warnings.append(f'Known ASNs · “{value}” is invalid and was excluded.')
+                elif asn not in asns:
+                    asns.append(asn)
+            if not parent: warnings.append(f'Target {number} · Parent organization is required.')
+            if not domains:
+                warnings.append(f'Target {number} · at least one valid target domain is required; target was excluded.')
+                continue
+            if parent:
+                normalized.append(dict(zip(input_engine.COLUMNS,
+                    [parent, entity, ';'.join(domains), ';'.join(asns), ';'.join(registrants)])))
         try:
-            targets = normalize_targets([row])
-            self.current_targets.extend(targets)
-            self.show_preview()
-            for widget in (self.parent_name, self.entity, self.domain, self.asns, self.registrants): widget.clear()
-        except ValueError as exc: QMessageBox.warning(self, 'Invalid target', str(exc))
+            return normalize_targets(normalized), warnings
+        except ValueError as exc:
+            warnings.append(str(exc)); return [], warnings
+
+    def show_validation_summary(self, warnings):
+        if hasattr(self, 'validation_banner'):
+            count = len(warnings)
+            self.validation_banner.setText(f'Some information needs attention · {count} entries excluded.\n'+'\n'.join(warnings))
+        self.validation_banner.setVisible(bool(warnings))
+        if warnings: self.validation_banner.show()
 
     def import_excel(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Import target workbook', '', 'Excel files (*.xlsx *.xls)')
@@ -458,10 +542,9 @@ class MainWindow(QMainWindow):
         rows = [dict(zip(input_engine.COLUMNS, [t['parent_organization'], t['target_entity'],
                  ';'.join(t['target_domains']), ';'.join(t['known_asns']),
                  ';'.join(t['known_registrant_names'])])) for t in self.current_targets]
-        try:
-            self.current_targets = normalize_targets(rows)
-        except ValueError as exc:
-            QMessageBox.warning(self, 'Invalid target list', str(exc)); return
+        self.current_targets, warnings = self._validated_target_rows(rows)
+        self.show_validation_summary(warnings)
+        if not self.current_targets: return
         for job in self.jobs.values():
             if job['finished']: job['visible_in_workspace'] = False
         self.current_run = None; self.current_rows = []
@@ -545,7 +628,9 @@ class MainWindow(QMainWindow):
 
     def on_job_progress(self, job_id, stage, current, total, item):
         job = self.jobs[job_id]
-        if stage == 'candidates':
+        if stage == 'run':
+            job['run_id'] = current
+        elif stage == 'candidates':
             job['candidates'] += current
             job['hostnames'] += int(item)
         elif stage == 'verified':
@@ -555,6 +640,7 @@ class MainWindow(QMainWindow):
         job['card'].update_metrics(time.monotonic()-job['started'],
                                    job['hostnames'],job['candidates'],job['verified'])
         self.statusBar().showMessage(f"{job['organization']} · {stage.title()} · {item}")
+        if self.stack.currentIndex() == 0: self.refresh_dashboard()
 
     def on_job_completed(self, job_id, run_id, status, error):
         job = self.jobs[job_id]
@@ -909,7 +995,16 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.evidence_search)
         panel = card('panel'); contents = QVBoxLayout(panel)
         contents.setContentsMargins(10, 10, 10, 10)
-        self.evidence_table = table(['IP', 'Source', 'Observation', 'Points'])
+        self.evidence_table = table(['IP / Target', 'Evidence Family', 'Observation', 'Points'])
+        header = self.evidence_table.horizontalHeader()
+        header.setSectionResizeMode(0,QHeaderView.Interactive)
+        header.setSectionResizeMode(1,QHeaderView.Interactive)
+        header.setSectionResizeMode(2,QHeaderView.Stretch)
+        header.setSectionResizeMode(3,QHeaderView.Fixed)
+        self.evidence_table.setColumnWidth(0,170); self.evidence_table.setColumnWidth(1,150)
+        self.evidence_table.setColumnWidth(3,72)
+        self.evidence_table.setMinimumWidth(560)
+        self.evidence_table.horizontalHeader().setMinimumSectionSize(58)
         self.evidence_table.cellDoubleClicked.connect(self.open_evidence_detail)
         contents.addWidget(self.evidence_table); outer.addWidget(panel, 1)
         self.evidence_items = []
@@ -938,6 +1033,10 @@ class MainWindow(QMainWindow):
                 self.evidence_items.append((row, source, detail, points))
         fill(self.evidence_table, [[row['ip'], source, detail, points]
                                    for row, source, detail, points in self.evidence_items])
+        for visual_row in range(self.evidence_table.rowCount()):
+            item = self.evidence_table.item(visual_row,3)
+            item.setTextAlignment(Qt.AlignCenter)
+        self.evidence_table.horizontalHeaderItem(3).setTextAlignment(Qt.AlignCenter)
 
     def open_evidence_detail(self, visual_row, _column):
         item = self.evidence_table.item(visual_row, 0)
@@ -956,7 +1055,16 @@ class MainWindow(QMainWindow):
         self.organizations_table = table(['Organization', 'Runs', 'Candidates', 'EASM Assets'])
         contents.addWidget(self.organizations_table); outer.addWidget(panel, 1)
         self.organizations_table.cellDoubleClicked.connect(self.open_organization)
+        actions = QHBoxLayout(); actions.addWidget(label('Organization actions', 'sectionTitle')); actions.addStretch()
+        self.delete_organization_button = button('Delete selected organization', self.delete_selected_organization)
+        self.delete_organization_button.setObjectName('danger'); actions.addWidget(self.delete_organization_button)
+        outer.insertLayout(2,actions)
         return page
+
+    def delete_selected_organization(self):
+        selected = self.organizations_table.currentRow()
+        item = self.organizations_table.item(selected,0) if selected >= 0 else None
+        if item: self.delete_organization(item.text())
 
     def open_organization(self, row, col):
         item = self.organizations_table.item(row, 0)
@@ -975,7 +1083,7 @@ class MainWindow(QMainWindow):
         actions.addStretch(); outer.addLayout(actions)
         panel = card('panel'); contents = QVBoxLayout(panel)
         contents.setContentsMargins(12, 12, 12, 12)
-        self.history_table = table(['Run', 'Started', 'Completed', 'Status', 'Candidates', 'Organizations'])
+        self.history_table = table(['Run', 'Started', 'Completed', 'Status', 'Candidates', 'Organization actions'])
         self.history_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         contents.addWidget(self.history_table); outer.addWidget(panel, 1)
         self.history_table.cellDoubleClicked.connect(lambda r,_: self._open_selected_run(self.history_table, r))
@@ -983,6 +1091,8 @@ class MainWindow(QMainWindow):
 
     def history_menu(self, run_id, control):
         menu = QMenu(self)
+        menu.addAction('Delete analysis', lambda: self.delete_analysis(run_id))
+        menu.addSeparator()
         for organization in sorted({t['parent_organization'] for t in self.store.targets(run_id)}):
             group = menu.addMenu(organization)
             group.addAction('Open', lambda name=organization: self.open_organization_run(name, run_id))
@@ -990,6 +1100,34 @@ class MainWindow(QMainWindow):
             group.addSeparator()
             group.addAction('Delete', lambda name=organization: self.delete_organization(name))
         menu.exec(control.mapToGlobal(control.rect().bottomLeft()))
+
+    def delete_analysis(self, run_id):
+        active = any(not job['finished'] and job.get('run_id') == run_id for job in self.jobs.values())
+        if active: QMessageBox.information(self,'Analysis running','Wait for this analysis to finish before deleting it.'); return
+        if self.worker and self.worker.isRunning() and self.current_run == run_id:
+            QMessageBox.information(self,'Analysis running','Wait for this analysis to finish before deleting it.'); return
+        dialog = QMessageBox(self); dialog.setWindowTitle('Delete analysis')
+        dialog.setText(f'Delete analysis #{run_id}?')
+        dialog.setInformativeText('This removes this run, its candidates, results and evidence. The organization and its other analyses remain.')
+        cancel = dialog.addButton('Cancel',QMessageBox.RejectRole)
+        delete = dialog.addButton('Delete Analysis',QMessageBox.DestructiveRole)
+        dialog.setDefaultButton(cancel); dialog.setEscapeButton(cancel); dialog.exec()
+        if dialog.clickedButton() is not delete: return
+        try: self.store.delete_run(run_id)
+        except Exception as exc: QMessageBox.warning(self,'Unable to delete analysis',str(exc)); return
+        for job_id,job in list(self.jobs.items()):
+            if job.get('run_id') == run_id: self.jobs.pop(job_id,None)
+        self.analysis_deleted.emit(run_id)
+
+    def on_analysis_deleted(self, run_id):
+        if self.current_run == run_id:
+            self.current_run = None; self.current_rows = []; self.search.clear()
+            self.org_filter.blockSignals(True); self.org_filter.clear(); self.org_filter.addItem('All organizations'); self.org_filter.blockSignals(False)
+            self.run_heading.setText('Open an analysis from Dashboard or History.')
+            self.key_findings.setText('Open an analysis to review its main findings.')
+            self.inspector.hide()
+        self.refresh_history(); self.refresh_dashboard(); self.refresh_organizations(); self.refresh_exports()
+        if self.current_run is None: self.refresh_evidence()
 
     def open_organization_run(self, organization, run_id):
         self.open_run(run_id)
@@ -1019,16 +1157,24 @@ class MainWindow(QMainWindow):
                     except RuntimeError:
                         pass  # Completed cards have already left the view.
                 del self.jobs[job_id]
-        self.current_targets = [t for t in self.current_targets if t['parent_organization'].casefold() != organization.casefold()]
-        self.current_rows = [r for r in self.current_rows if r['organization'].casefold() != organization.casefold()]
-        if self.current_run and not self.store.targets(self.current_run): self.current_run = None
-        self.inspector.hide()
-        self.org_filter.blockSignals(True); self.org_filter.clear(); self.org_filter.addItem('All organizations')
-        self.org_filter.addItems(sorted({r['organization'] for r in self.current_rows})); self.org_filter.blockSignals(False)
-        self.show_preview(); self.filter_results(); self.refresh(); self.refresh_evidence()
-        self.run_heading.setText(f'{len(self.current_rows)} candidates in the current view')
-        self.key_findings.clear()
-        self.statusBar().showMessage(f'Deleted {organization} and its saved analyses permanently')
+        self.organization_deleted.emit(organization)
+
+    def on_organization_deleted(self, organization):
+        if organization:
+            self.current_targets = [t for t in self.current_targets if t['parent_organization'].casefold() != organization.casefold()]
+            self.current_rows = [r for r in self.current_rows if r['organization'].casefold() != organization.casefold()]
+            for job_id,job in list(self.jobs.items()):
+                if job['organization'].casefold() == organization.casefold(): self.jobs.pop(job_id,None)
+            if self.current_run and not self.store.targets(self.current_run): self.current_run = None
+            self.org_filter.blockSignals(True); self.org_filter.clear(); self.org_filter.addItem('All organizations')
+            self.org_filter.addItems(sorted({r['organization'] for r in self.current_rows})); self.org_filter.blockSignals(False)
+            self.show_preview(); self.filter_results()
+            self.run_heading.setText(f'{len(self.current_rows)} candidates in the current view')
+            self.key_findings.clear()
+            self.statusBar().showMessage(f'Deleted {organization} and its saved analyses permanently')
+        self.inspector.hide(); self.search.clear(); self.evidence_search.clear()
+        self.refresh()
+        if self.current_run is None: self.refresh_evidence()
 
     def confirm_organization_deletion(self, organization):
         dialog = QMessageBox(self); dialog.setWindowTitle('Delete organization')
@@ -1060,7 +1206,7 @@ class MainWindow(QMainWindow):
     def export_organization(self, organization, run_id):
         from pathlib import Path
         from .export import OPTIONS
-        run = next((r for r in self.store.runs() if r['id'] == run_id), None)
+        run = self.store.run(run_id)
         if not run or run['status'] != 'COMPLETED':
             QMessageBox.information(self, 'Export', 'Exports are available for completed analyses.'); return
         dialog = QDialog(self); dialog.setWindowTitle(f'Export {organization}')
@@ -1090,16 +1236,42 @@ class MainWindow(QMainWindow):
                 if choice.clickedButton() is not replace: return
                 overwrite = True
             try:
-                export_results(self.store.results(run_id), destination, mode=options.currentText(),
-                               organization=organization, overwrite=overwrite)
-                self.statusBar().showMessage(f'Exported {organization} to {destination}', 15000)
-            except Exception as exc:
-                QMessageBox.warning(self, 'Export failed', str(exc))
+                worker=ExportWorker(self.store.path,run_id,organization,destination,options.currentText(),overwrite,self)
+                self.export_workers.append(worker)
+                worker.completed.connect(self.on_export_completed)
+                self.statusBar().showMessage(f'Exporting {organization}…')
+                worker.start()
+            except Exception:
+                QMessageBox.warning(self, 'Export failed', 'Could not start the workbook export.')
             return
+
+    def on_export_completed(self, organization, destination, error):
+        self.export_workers=[w for w in self.export_workers if w.isRunning()]
+        if error:
+            QMessageBox.warning(self,'Export failed',error); self.statusBar().showMessage('Export failed'); return
+        self.statusBar().showMessage(f'Exported {organization} to {destination}',15000)
+        dialog=QMessageBox(self); dialog.setWindowTitle('Export Complete')
+        dialog.setText(f'{organization} analysis exported successfully.')
+        open_file=dialog.addButton('Open File',QMessageBox.ActionRole)
+        open_folder=dialog.addButton('Open Folder',QMessageBox.ActionRole)
+        dialog.addButton('Close',QMessageBox.AcceptRole); dialog.exec()
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        target=destination if dialog.clickedButton() is open_file else str(Path(destination).parent) if dialog.clickedButton() is open_folder else None
+        if target:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(target))
 
     def _open_selected_run(self, widget, visual_row):
         item = widget.item(visual_row,0)
-        if item: self.open_run(int(item.text()))
+        if not item: return
+        run_id=item.data(Qt.UserRole)
+        if run_id is not None: self.open_run(int(run_id))
+        else: self.navigate(6)
+
+    def delete_selected_analysis(self):
+        selected = self.history_table.currentRow()
+        item = self.history_table.item(selected,0) if selected >= 0 else None
+        if item: self.delete_analysis(int(item.text()))
 
     def retry_selected(self):
         item = self.history_table.item(self.history_table.currentRow(),0)
@@ -1265,6 +1437,10 @@ class MainWindow(QMainWindow):
     def apply_theme(self, name):
         self.settings.setValue('theme', name)
         dark = name == 'Dark' or (name == 'System' and self.system_dark)
+        palette=QApplication.palette()
+        palette.setColor(QPalette.Highlight,QColor('#4B4B4F' if dark else '#DDE6F0'))
+        palette.setColor(QPalette.HighlightedText,QColor('#F1F1F2' if dark else '#243248'))
+        QApplication.instance().setPalette(palette)
         QApplication.instance().setStyleSheet(DARK if dark else LIGHT)
         if hasattr(self, 'theme_box') and self.theme_box.currentText() != name:
             self.theme_box.setCurrentText(name)
@@ -1280,30 +1456,59 @@ class MainWindow(QMainWindow):
         return super().eventFilter(source, event)
 
     def refresh(self):
-        runs = [run for run in self.store.runs() if run['status'] != 'RUNNING']
-        fill(self.recent, [[r['id'],r['started'][:19],r['status'],r['count']] for r in runs[:10]])
-        fill(self.history_table, [[r['id'],r['started'][:19],(r['completed'] or '')[:19],r['status'],r['count'],
-            ' · '.join(sorted({t['parent_organization'] for t in self.store.targets(r['id'])}))] for r in runs])
-        for row in range(self.history_table.rowCount()):
-            run_id = int(self.history_table.item(row,0).text())
-            names = self.history_table.item(row,5).text()
-            control = button(names + '  ⋯', lambda: None)
-            control.clicked.connect(lambda _=False, run=run_id, item=control: self.history_menu(run,item))
-            self.history_table.setCellWidget(row,5,control)
-        self.refresh_exports()
-        all_rows = [row for run in runs for row in self.store.results(run['id'])]
-        included = sum(bool(r['included']) for r in all_rows)
-        self.dashboard_summary.setText(f'{len(runs)} analyses · {len(all_rows)} candidates · {included} defensible assets')
-        orgs = {}
-        for row in all_rows:
-            record = orgs.setdefault(row['organization'], {'runs':set(),'candidates':0,'assets':0})
-            record['runs'].add(row['run_id']); record['candidates']+=1; record['assets']+=bool(row['included'])
-        fill(self.organizations_table, [[name,len(v['runs']),v['candidates'],v['assets']] for name,v in sorted(orgs.items())])
-        for value, count in zip(self.dashboard_numbers, (len(runs), len(all_rows), included, len(orgs))):
-            value.setText(str(count))
+        page=self.stack.currentIndex()
+        if page == 0: self.refresh_dashboard()
+        elif page == 3: self.refresh_organizations()
+        elif page == 4: self.refresh_history()
+        elif page == 8: self.refresh_exports()
+
+    def refresh_recent(self):
+        limit=self.recent_limit if self.recent_expanded else 3
+        rows=self.store.recent_analyses(limit=limit)
+        values={(r['run_id'],r['organization'].casefold()):r for r in rows}
+        for job in self.jobs.values():
+            if job.get('finished') or job.get('visible_in_workspace') is False: continue
+            for target in job['targets']:
+                key=(job.get('run_id'),job['organization'].casefold())
+                old=values.get(key,{})
+                values[key]={'run_id':job.get('run_id'),'organization':job['organization'],
+                    'entity':' · '.join(t['target_entity'] for t in job['targets']),'started':old.get('started'),'status':job['status'].upper(),
+                    'candidates':job['candidates'],'assets':sum(bool(r['included']) for r in job.get('records',[])),
+                    'rejected':job['card'].rejected}
+        recent=sorted(values.values(),key=lambda r:(r['status']=='RUNNING',r.get('started') or '',r.get('run_id') or 0),reverse=True)[:limit]
+        fill(self.recent,[[r['organization'],r['entity'],(r.get('started') or 'Starting')[:19],
+            r['status'].title(),r['candidates'],r['assets']] for r in recent])
+        for index,row in enumerate(recent):
+            self.recent.item(index,0).setData(Qt.UserRole,row.get('run_id'))
+            self.recent.item(index,0).setToolTip(f"{row['rejected']} rejected · {row['assets']} verified")
+        self.recent_more.setVisible(self.recent_expanded and len(rows)>=limit and limit<100)
+
+    def refresh_dashboard(self):
+        counts=self.store.dashboard_metrics()
+        runs,candidates,assets,organizations=counts
+        self.dashboard_summary.setText(f'{runs} analyses · {candidates} candidates · {assets} defensible assets')
+        for value,count in zip(self.dashboard_numbers,counts): value.setText(str(count))
+        self.refresh_recent()
+
+    def refresh_organizations(self):
+        rows=self.store.organization_overview()
+        fill(self.organizations_table,[[r['name'],r['runs'],r['candidates'],r['assets']] for r in rows])
+
+    def refresh_history(self):
+        runs=[r for r in self.store.runs() if r['status']!='RUNNING']
+        rows=[]
+        for run in runs:
+            names=sorted({t['parent_organization'] for t in json.loads(run['targets_json'])})
+            rows.append([run['id'],run['started'][:19],(run['completed'] or '')[:19],run['status'],run['count'],' · '.join(names)])
+        fill(self.history_table,rows)
+        for index in range(self.history_table.rowCount()):
+            run_id=int(self.history_table.item(index,0).text()); names=self.history_table.item(index,5).text()
+            control=button((names or 'No analyses')+'  ⋯',lambda:None)
+            control.clicked.connect(lambda _=False,run=run_id,item=control:self.history_menu(run,item))
+            self.history_table.setCellWidget(index,5,control)
 
     def closeEvent(self, event):
-        if any(w.isRunning() for w in self.provider_tests) or (self.worker and self.worker.isRunning()) or any(
+        if any(w.isRunning() for w in self.export_workers) or any(w.isRunning() for w in self.provider_tests) or (self.worker and self.worker.isRunning()) or any(
                 job['worker'] and not job['finished'] for job in self.jobs.values()):
             QMessageBox.information(self, 'Analysis running', 'Cancel the analysis and wait for it to stop before closing.')
             event.ignore(); return

@@ -48,6 +48,7 @@ class AnalysisWorker(QThread):
             logger.setLevel(logging.INFO)
         run_id = store.start(self.targets)
         logger.info('Analysis %s started (%s targets)', run_id, len(self.targets))
+        self.progress.emit('run', run_id, run_id, self.targets[0]['parent_organization'] if self.targets else '')
         records = []
         status = 'COMPLETED'
         error = ''
@@ -171,3 +172,31 @@ class ProviderTestWorker(QThread):
             self.completed.emit('Connection unavailable; check network and provider access')
         finally:
             self.values.clear()
+
+
+class ExportWorker(QThread):
+    completed = Signal(str, str, str)
+
+    def __init__(self, db_path, run_id, organization, destination, mode, overwrite, parent=None):
+        super().__init__(parent)
+        self.db_path, self.run_id, self.organization = db_path, run_id, organization
+        self.destination, self.mode, self.overwrite = destination, mode, overwrite
+
+    def run(self):
+        try:
+            from .storage import Store
+            from .export import export_results
+            snapshot=Store(self.db_path).export_data(self.run_id,self.organization)
+            if snapshot is None:
+                raise ValueError('The selected analysis was removed or is no longer complete.')
+            run,targets,rows=snapshot
+            metadata={**run,'targets':targets,'organization':self.organization}
+            export_results(rows,self.destination,mode=self.mode,organization=self.organization,
+                           overwrite=self.overwrite,metadata=metadata)
+            self.completed.emit(self.organization,self.destination,'')
+        except FileExistsError:
+            self.completed.emit(self.organization,self.destination,'That file already exists. Choose Save As and try again.')
+        except PermissionError:
+            self.completed.emit(self.organization,self.destination,'The destination is not writable or the workbook is open in another application.')
+        except Exception as exc:
+            self.completed.emit(self.organization,self.destination,str(exc))

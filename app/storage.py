@@ -46,6 +46,11 @@ class Store:
                     finding_json TEXT NOT NULL, entity TEXT NOT NULL, domains_json TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS ix_results_run ON results(run_id);
                 CREATE INDEX IF NOT EXISTS ix_results_org ON results(org_id);
+                CREATE INDEX IF NOT EXISTS ix_results_run_org_status ON results(run_id,org_id,status,included);
+                CREATE INDEX IF NOT EXISTS ix_results_ip ON results(ip);
+                CREATE INDEX IF NOT EXISTS ix_results_hostname ON results(hostname);
+                CREATE INDEX IF NOT EXISTS ix_run_targets_org_run ON run_targets(org_id,run_id);
+                CREATE INDEX IF NOT EXISTS ix_runs_status_started ON runs(status,started);
             ''')
             if not con.execute('SELECT 1 FROM schema_version').fetchone():
                 con.execute('INSERT INTO schema_version VALUES (1)')
@@ -82,6 +87,60 @@ class Store:
         with self.connect() as con:
             return [dict(r) for r in con.execute('''SELECT runs.*, count(results.id) AS count FROM runs
                 LEFT JOIN results ON results.run_id=runs.id GROUP BY runs.id ORDER BY runs.id DESC''')]
+
+    def run(self, run_id):
+        with self.connect() as con:
+            row=con.execute('''SELECT r.*,count(x.id) AS count FROM runs r LEFT JOIN results x ON x.run_id=r.id
+                               WHERE r.id=? GROUP BY r.id''',(int(run_id),)).fetchone()
+            return dict(row) if row else None
+
+    def recent_analyses(self, limit=3, offset=0):
+        with self.connect() as con:
+            return [dict(row) for row in con.execute('''
+                SELECT r.id AS run_id, r.started, r.completed, r.status,
+                       o.name AS organization, t.entity,
+                       count(res.id) AS candidates,
+                       coalesce(sum(CASE WHEN res.included=1 THEN 1 ELSE 0 END),0) AS assets,
+                       coalesce(sum(CASE WHEN res.included=0 AND res.status!='PENDING' THEN 1 ELSE 0 END),0) AS rejected
+                FROM runs r JOIN run_targets t ON t.run_id=r.id
+                JOIN organizations o ON o.id=t.org_id
+                LEFT JOIN results res ON res.run_id=r.id AND res.org_id=o.id AND res.entity=t.entity
+                GROUP BY r.id,o.id,t.entity
+                ORDER BY r.started DESC,r.id DESC LIMIT ? OFFSET ?''', (int(limit),int(offset)))]
+
+    def dashboard_metrics(self):
+        with self.connect() as con:
+            runs, candidates, assets, organizations = con.execute('''
+                SELECT count(DISTINCT CASE WHEN r.status!='RUNNING' THEN r.id END), count(res.id),
+                       coalesce(sum(res.included),0), count(DISTINCT CASE WHEN res.id IS NOT NULL THEN o.id END)
+                FROM organizations o JOIN run_targets t ON t.org_id=o.id
+                JOIN runs r ON r.id=t.run_id LEFT JOIN results res ON res.org_id=o.id AND res.run_id=r.id''').fetchone()
+            return runs,candidates,assets,organizations
+
+    def organization_overview(self):
+        with self.connect() as con:
+            return [dict(row) for row in con.execute('''
+                SELECT o.name, count(DISTINCT r.id) AS runs, count(res.id) AS candidates,
+                       coalesce(sum(res.included),0) AS assets
+                FROM organizations o LEFT JOIN run_targets t ON t.org_id=o.id
+                LEFT JOIN runs r ON r.id=t.run_id AND r.status!='RUNNING'
+                LEFT JOIN results res ON res.run_id=r.id AND res.org_id=o.id
+                GROUP BY o.id ORDER BY o.name COLLATE NOCASE''')]
+
+    def export_data(self, run_id, organization):
+        with self.connect() as con:
+            con.execute('BEGIN')
+            run = con.execute('SELECT * FROM runs WHERE id=?', (int(run_id),)).fetchone()
+            if run is None or run['status'] != 'COMPLETED': return None
+            targets = json.loads(run['targets_json'])
+            targets = [t for t in targets if t['parent_organization'].casefold() == organization.casefold()]
+            rows = con.execute('''SELECT x.*,o.name AS organization FROM results x
+                JOIN organizations o ON o.id=x.org_id WHERE x.run_id=? AND o.name=? COLLATE NOCASE ORDER BY x.id''',
+                (int(run_id),organization))
+            results = [{**dict(row), 'candidate':json.loads(row['candidate_json']),
+                        'finding':json.loads(row['finding_json']), 'domains':json.loads(row['domains_json'])}
+                       for row in rows]
+            return dict(run), targets, results
 
     def results(self, run_id):
         with self.connect() as con:
@@ -129,3 +188,15 @@ class Store:
                 else:
                     con.execute('DELETE FROM runs WHERE id=?', (run['id'],))
             con.execute('DELETE FROM organizations WHERE id=?', (org_id,))
+
+    def delete_run(self, run_id):
+        """Delete one run and its dependent records while retaining its organizations."""
+        with self.connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            run = con.execute('SELECT status FROM runs WHERE id=?', (int(run_id),)).fetchone()
+            if run is None: return
+            if run['status'] == 'RUNNING':
+                raise ValueError('Wait for this analysis to finish before deleting it.')
+            con.execute('DELETE FROM results WHERE run_id=?', (int(run_id),))
+            con.execute('DELETE FROM run_targets WHERE run_id=?', (int(run_id),))
+            con.execute('DELETE FROM runs WHERE id=?', (int(run_id),))

@@ -5,6 +5,7 @@ import pytest
 from PySide6.QtCore import Qt, QSettings, QPoint, QPointF
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox, QLineEdit
+from PySide6.QtTest import QTest
 
 from app import credentials, engine
 from app.export import OPTIONS, export_results
@@ -92,8 +93,8 @@ def test_export_scopes_and_empty_workbooks(tmp_path, mode):
     for frame in sheets.values():
         assert 'Bravo' not in frame.to_string()
     if mode == 'Export Full Workbook':
-        assert list(sheets) == ['Summary','Verified Assets','Candidates','Rejected','Evidence']
-        assert len(sheets['Verified Assets']) == 1
+        assert list(sheets) == ['Summary','EASM Assets','Candidates','Rejected','Evidence','Score Breakdown','Score Guide']
+        assert len(sheets['EASM Assets']) == 1
         assert len(sheets['Rejected']) == 1
         assert len(sheets['Candidates']) == 3
     if mode in ('Export EASM Assets','Export Verified Results','Export Rejected'):
@@ -116,10 +117,18 @@ def test_export_from_page_without_opening_and_save_as(desktop, tmp_path, monkeyp
     paths = iter([str(original),str(destination)])
     monkeypatch.setattr(QDialog,'exec',lambda dialog: QDialog.Accepted)
     monkeypatch.setattr(QFileDialog,'getSaveFileName',lambda *a,**kw: (next(paths),'Excel'))
-    monkeypatch.setattr(QMessageBox,'exec',lambda dialog: next(b for b in dialog.buttons() if b.text()=='Save As').click())
+    def choose_save_as(dialog):
+        save_as=next((b for b in dialog.buttons() if b.text()=='Save As'),None)
+        if save_as is not None: save_as.click()
+        else: return QMessageBox.Close
+    monkeypatch.setattr(QMessageBox,'exec',choose_save_as)
     row = next(r for r in range(window.exports_table.rowCount()) if window.exports_table.item(r,0).text()=='Alpha')
     window.exports_table.cellWidget(row,5).click()
     assert original.read_bytes() == b'keep original'
+    worker=window.export_workers[-1]
+    assert worker.wait(10000)
+    desktop[0].processEvents()
+    assert destination.exists()
     assert pd.read_excel(destination, sheet_name='Candidates')['Organization'].tolist() == ['Alpha']
     assert window.current_run is None
 
@@ -174,3 +183,62 @@ def test_preview_retains_structured_values(desktop):
     assert window.preview.item(0,3).data(Qt.UserRole+1) == ['AS64500','AS64501']
     assert window.preview.item(0,4).data(Qt.UserRole+1) == ['Alpha Inc.','Alpha, Inc.']
     assert window.preview.item(0,4).toolTip() == 'Alpha Inc.\nAlpha, Inc.'
+
+
+def test_delete_single_analysis_keeps_organization_and_other_runs(desktop, monkeypatch):
+    app,window=desktop
+    runs=[]
+    for label in ('A','B','C'):
+        run=window.store.start([target('Alpha')]); window.store.finish(run,[result('Alpha',f'1.1.1.{len(runs)+1}')]); runs.append(run)
+    window.navigate(4); window.open_run(runs[1])
+    def confirm(dialog):
+        assert 'organization and its other analyses remain' in dialog.informativeText()
+        next(b for b in dialog.buttons() if b.text()=='Delete Analysis').click()
+    monkeypatch.setattr(QMessageBox,'exec',confirm)
+    window.delete_analysis(runs[1])
+    assert [r['id'] for r in window.store.runs()] == [runs[2],runs[0]]
+    assert window.store.organization_overview() == [{'name':'Alpha','runs':2,'candidates':2,'assets':2}]
+    assert window.current_run is None and window.current_rows == []
+    assert window.history_table.rowCount() == 2
+    assert len(window.store.recent_analyses(10)) == 2
+    assert window.store.organization_summaries()[0]['run_id'] == runs[2]
+
+
+def test_dashboard_recent_compact_expands_and_collapses(desktop):
+    app,window=desktop
+    for index in range(12):
+        run=window.store.start([target('Alpha')]); window.store.finish(run,[result('Alpha',f'1.1.{index//254}.{index+1}')])
+    window.resize(1000,650); window.show(); window.navigate(0); app.processEvents()
+    assert window.recent.rowCount() == 3 and window.recent.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    assert window.recent_panel.maximumHeight() <= 260
+    window.toggle_recent_analyses(); app.processEvents(); QTest.qWait(250)
+    assert window.recent_expanded and window.recent.rowCount() == 10
+    assert window.recent_panel.height() > 260
+    assert window.stack.currentWidget().verticalScrollBar().maximum() > 0
+    window.toggle_recent_analyses(); app.processEvents(); QTest.qWait(250)
+    assert not window.recent_expanded and window.recent.rowCount() == 3
+    assert window.recent_panel.maximumHeight() == 260
+
+
+def test_dashboard_recent_query_does_not_load_full_result_history(desktop, monkeypatch):
+    _,window=desktop
+    run=window.store.start([target('Alpha')]); window.store.finish(run,[result('Alpha')])
+    monkeypatch.setattr(window.store,'results',lambda *_: pytest.fail('Dashboard must use aggregate queries'))
+    window.refresh_dashboard()
+    assert window.recent.rowCount() == 1
+
+
+def test_new_analysis_accepts_natural_lists_and_reports_invalid_values(desktop):
+    _,window=desktop
+    raw=dict(zip(engine.input_engine.COLUMNS,['CIBC','CIBC','cibc.com, wrongdomain\ncibc.ca','AS12345, hello\n27385','CIBC Inc.; CIBC, Inc.']))
+    normalized,warnings=window._validated_target_rows([raw])
+    assert normalized[0]['target_domains'] == ['cibc.com','cibc.ca']
+    assert normalized[0]['known_asns'] == ['AS12345','AS27385']
+    assert normalized[0]['known_registrant_names'] == ['CIBC Inc.','CIBC, Inc.']
+    assert len(warnings) == 2
+    window.show_validation_summary(warnings)
+    assert not window.validation_banner.isHidden()
+    assert 'wrongdomain' in window.validation_banner.text() and 'hello' in window.validation_banner.text()
+    invalid=dict(zip(engine.input_engine.COLUMNS,['CIBC','CIBC','bad-domain-value','ASHELLO','']))
+    normalized,warnings=window._validated_target_rows([invalid])
+    assert normalized == [] and any('valid target domain is required' in warning for warning in warnings)
