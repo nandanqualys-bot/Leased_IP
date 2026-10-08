@@ -33,8 +33,8 @@ def censys_enabled(cfg):
     return bool(cfg.get("censys_api_token") or os.getenv("CENSYS_API_TOKEN")) and bool(cfg.get("censys_org_id") or os.getenv("CENSYS_ORG_ID"))
 
 def censys_headers(cfg):
-    token=cfg.get("censys_api_token") or os.getenv("CENSYS_API_TOKEN","")
-    org=cfg.get("censys_org_id") or os.getenv("CENSYS_ORG_ID","")
+    token=os.getenv("CENSYS_API_TOKEN") or cfg.get("censys_api_token","")
+    org=os.getenv("CENSYS_ORG_ID") or cfg.get("censys_org_id","")
     return {"Authorization":f"Bearer {token}","X-Organization-ID":org,"Accept":"application/json"}
 
 def _walk_dicts(obj):
@@ -52,7 +52,7 @@ def censys_domain_history(client,cfg,domain,days=31):
         from datetime import timedelta
         end=datetime.now(timezone.utc); start=end-timedelta(days=days)
         url=f"{CENSYS_BASE}/dns/resolutions/{domain}/bounds"
-        params={"organization_id":cfg.get("censys_org_id") or os.getenv("CENSYS_ORG_ID"),
+        params={"organization_id":os.getenv("CENSYS_ORG_ID") or cfg.get("censys_org_id"),
                 "start_time":start.isoformat().replace("+00:00","Z"),
                 "end_time":end.isoformat().replace("+00:00","Z"),
                 "record_types":"A","page_size":100}
@@ -79,7 +79,7 @@ def censys_ip_names(client,cfg,ip,domain_filter=None,days=31):
         from datetime import timedelta
         end=datetime.now(timezone.utc); start=end-timedelta(days=days)
         url=f"{CENSYS_BASE}/dns/resolutions/ip/{ip}/ranges"
-        params={"organization_id":cfg.get("censys_org_id") or os.getenv("CENSYS_ORG_ID"),
+        params={"organization_id":os.getenv("CENSYS_ORG_ID") or cfg.get("censys_org_id"),
                 "start_time":start.isoformat().replace("+00:00","Z"),
                 "end_time":end.isoformat().replace("+00:00","Z"),
                 "record_types":"A","page_size":100}
@@ -205,7 +205,7 @@ def crt_assoc(client,domains,ip):
                 for row in r.json():
                     for n in str(row.get("name_value","")).splitlines():
                         n=n.strip().lower().lstrip("*.")
-                        if n.endswith(d): names.append(n)
+                        if host_matches(n,[d]): names.append(n)
         except Exception: pass
     return sorted(set(names))
 
@@ -261,7 +261,7 @@ def score_candidate(t,c,client,cfg):
     if ptrname and host_matches(ptrname,domains):
         score+=15; ev.append("Reverse DNS contains target-controlled domain")
         evidence_records.append(("Reverse DNS",ptrname,15))
-    sh=shodan(client,cfg.get("shodan_api_key") or os.getenv("SHODAN_API_KEY",""),ip)
+    sh=shodan(client,os.getenv("SHODAN_API_KEY") or cfg.get("shodan_api_key",""),ip)
     shhosts=(sh.get("hostnames") or [])+(sh.get("domains") or [])
     if any(host_matches(x,domains) for x in shhosts):
         score+=10; ev.append("Shodan hostname/domain association")
@@ -286,7 +286,9 @@ def score_candidate(t,c,client,cfg):
 
     # Negative signals
     unrelated=rd_org and not any(n in rd_org.lower() for n in target_names)
-    if unrelated:
+    # A cloud provider's registration is expected for hosted services when the
+    # target currently resolves to the IP and serves a matching certificate.
+    if unrelated and not (current_dns_hosts and tls_direct):
         score-=30; ev.append("RDAP shows an unrelated network organization")
         evidence_records.append(("RDAP",f"Negative: {rd_org}",-30))
     score=max(0,min(100,score))

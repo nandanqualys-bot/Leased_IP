@@ -4,11 +4,12 @@ import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout,
     QLabel, QPushButton, QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QLineEdit, QFileDialog, QMessageBox, QTabWidget, QFormLayout, QSpinBox,
     QComboBox, QDialog, QDialogButtonBox, QProgressBar, QPlainTextEdit, QCheckBox,
-    QAbstractItemView, QApplication)
+    QAbstractItemView, QApplication, QGraphicsDropShadowEffect)
 
 from .engine import input_engine, normalize_targets, targets_from_excel, slug
 from .storage import Store
@@ -32,6 +33,26 @@ def button(text, callback, primary=False):
     return widget
 
 
+def card(kind='panel', shadow=False):
+    frame = QFrame(); frame.setObjectName(kind)
+    if shadow:
+        effect = QGraphicsDropShadowEffect(frame)
+        effect.setBlurRadius(28); effect.setOffset(0, 8)
+        effect.setColor(QColor(25, 45, 68, 22))
+        frame.setGraphicsEffect(effect)
+    return frame
+
+
+def metric(title, value='0', note=''):
+    frame = card('metricCard', True)
+    contents = QVBoxLayout(frame); contents.setContentsMargins(20, 17, 20, 17)
+    contents.setSpacing(6)
+    contents.addWidget(label(title.upper(), 'eyebrow'))
+    number = label(str(value), 'metricValue'); contents.addWidget(number)
+    contents.addWidget(label(note, 'muted'))
+    return frame, number
+
+
 def table(columns):
     widget = QTableWidget(0, len(columns))
     widget.setHorizontalHeaderLabels(columns)
@@ -40,6 +61,8 @@ def table(columns):
     widget.horizontalHeader().setStretchLastSection(True)
     widget.verticalHeader().setVisible(False)
     widget.setAlternatingRowColors(True)
+    widget.verticalHeader().setDefaultSectionSize(42)
+    widget.setShowGrid(False)
     return widget
 
 
@@ -59,24 +82,36 @@ class DetailDialog(QDialog):
     def __init__(self, row, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{row['ip']} · Evidence")
-        self.resize(780, 620)
+        self.resize(850, 690)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 24, 26, 22); layout.setSpacing(15)
         finding = row['finding']; candidate = row['candidate']
-        layout.addWidget(label(f"{row['ip']}  ·  {row['status']}", 'heading'))
+        layout.addWidget(label('ASSET INTELLIGENCE', 'eyebrow'))
+        title = QHBoxLayout(); title.addWidget(label(row['ip'], 'heading'), 1)
+        title.addWidget(label(row['status'].replace('_', ' '), 'statusChip'))
+        layout.addLayout(title)
         layout.addWidget(label(f"{row['organization']}  ·  {'; '.join(row['domains'])}", 'muted'))
+        summary = QHBoxLayout(); summary.setSpacing(12)
         for title, value in (
             ('Why discovered', '; '.join(candidate.get('discovery_sources', [])) + ' · ' + str(row.get('hostname') or '')),
             ('Infrastructure', f"Origin {candidate.get('origin_asn', 'Unknown')} · {finding.get('origin_org', 'Unknown')} · RDAP {finding.get('registered_org', 'Unknown')}"),
             ('Attribution', f"{finding.get('relationship', 'Unverified')} · {finding.get('confidence', 'Unknown')} · score {finding.get('score', '—')} · {'Included' if row['included'] else 'Excluded'}"),
-            ('Proof summary', finding.get('proof', 'No proof summary available')),
         ):
-            layout.addWidget(label(f'{title}: {value}'))
-        layout.addWidget(label('Evidence', 'heading'))
+            box = card('detailCard'); box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(15, 14, 15, 14)
+            box_layout.addWidget(label(title.upper(), 'eyebrow'))
+            box_layout.addWidget(label(value)); summary.addWidget(box, 1)
+        layout.addLayout(summary)
+        layout.addWidget(label('PROOF SUMMARY', 'eyebrow'))
+        layout.addWidget(label(finding.get('proof', 'No proof summary available')))
+        layout.addWidget(label('Evidence timeline', 'sectionTitle'))
         evidence = table(['Source', 'Observation', 'Points'])
         fill(evidence, finding.get('evidence', []))
         layout.addWidget(evidence, 1)
-        layout.addWidget(button('Copy IP', lambda: QApplication.clipboard().setText(row['ip'])))
-        layout.addWidget(button('Close', self.accept))
+        actions = QHBoxLayout()
+        actions.addWidget(button('Copy IP', lambda: QApplication.clipboard().setText(row['ip'])))
+        actions.addStretch(); actions.addWidget(button('Done', self.accept, True))
+        layout.addLayout(actions)
 
 
 class MainWindow(QMainWindow):
@@ -89,8 +124,8 @@ class MainWindow(QMainWindow):
         self.current_rows = []
         self.worker = None
         self.setWindowTitle('Atlas EASM · Off-ASN intelligence')
-        self.setMinimumSize(1050, 680)
-        self.resize(1320, 830)
+        self.setMinimumSize(1120, 720)
+        self.resize(1440, 900)
         self._build()
         self.apply_theme(self.settings.value('theme', 'Light'))
         self.refresh()
@@ -98,55 +133,90 @@ class MainWindow(QMainWindow):
     def _build(self):
         host = QWidget(); self.setCentralWidget(host)
         horizontal = QHBoxLayout(host); horizontal.setContentsMargins(0,0,0,0)
-        sidebar = QFrame(); sidebar.setObjectName('sidebar'); sidebar.setFixedWidth(215)
-        nav = QVBoxLayout(sidebar); nav.setContentsMargins(18,25,18,18); nav.setSpacing(10)
-        nav.addWidget(label('ATLAS EASM', 'heading'))
-        nav.addWidget(label('Infrastructure intelligence', 'muted'))
+        sidebar = QFrame(); sidebar.setObjectName('sidebar'); sidebar.setFixedWidth(236)
+        nav = QVBoxLayout(sidebar); nav.setContentsMargins(20,30,20,22); nav.setSpacing(8)
+        nav.addWidget(label('◈  ATLAS', 'brand'))
+        nav.addWidget(label('EASM  /  INTELLIGENCE', 'eyebrow'))
+        nav.addSpacing(38)
+        nav.addWidget(label('WORKSPACE', 'eyebrow'))
         self.stack = QStackedWidget()
+        self.nav_buttons = []
         for name, method in [('Dashboard', self._dashboard), ('New Analysis', self._new_analysis),
                              ('Results', self._results), ('Organizations', self._organizations),
                              ('History', self._history), ('Settings', self._settings)]:
             index = self.stack.addWidget(method())
-            nav.addWidget(button(name, lambda _=False, i=index: self.navigate(i)))
+            item = button(name, lambda _=False, i=index: self.navigate(i))
+            item.setObjectName('navItem'); item.setCursor(Qt.PointingHandCursor)
+            self.nav_buttons.append(item); nav.addWidget(item)
         nav.addStretch()
+        nav.addWidget(label('LOCAL DESKTOP APP', 'eyebrow'))
+        nav.addWidget(label('Private analysis workspace', 'muted'))
         horizontal.addWidget(sidebar); horizontal.addWidget(self.stack,1)
         self.statusBar().showMessage('Ready')
+        self.navigate(0)
 
     def navigate(self, index):
         self.stack.setCurrentIndex(index)
+        for i, item in enumerate(self.nav_buttons):
+            item.setProperty('active', i == index)
+            item.style().unpolish(item); item.style().polish(item)
         if index in (0, 3, 4): self.refresh()
 
     def _page(self, title):
         page = QWidget(); outer = QVBoxLayout(page)
-        outer.setContentsMargins(28,24,28,24); outer.setSpacing(14)
+        outer.setContentsMargins(34,30,34,30); outer.setSpacing(18)
         outer.addWidget(label(title, 'heading'))
         return page, outer
 
     def _dashboard(self):
         page, outer = self._page('Dashboard')
-        self.dashboard_summary = label('No analyses yet. Start with a target.'); outer.addWidget(self.dashboard_summary)
-        outer.addWidget(button('New analysis', lambda: self.navigate(1), True))
-        outer.addWidget(label('Recent analyses', 'heading'))
-        self.recent = table(['Run', 'Started', 'Status', 'Candidates']); outer.addWidget(self.recent)
+        outer.addWidget(label('A clear view of your external infrastructure, grounded in evidence.', 'muted'))
+        hero = card('hero'); hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(32, 27, 32, 27); hero_layout.setSpacing(10)
+        hero_layout.addWidget(label('DISCOVERY WORKSPACE', 'eyebrow'))
+        hero_layout.addWidget(label('Find the assets behind the signal.', 'heroTitle'))
+        hero_layout.addWidget(label('Discover broadly. Verify independently. Keep only defensible EASM assets.', 'heroText'))
+        hero_actions = QHBoxLayout()
+        hero_button = button('Start a new analysis  →', lambda: self.navigate(1))
+        hero_button.setObjectName('heroAction'); hero_actions.addWidget(hero_button)
+        hero_actions.addStretch(); hero_layout.addLayout(hero_actions)
+        outer.addWidget(hero)
+        metrics = QHBoxLayout(); metrics.setSpacing(14)
+        self.dashboard_numbers = []
+        for title, note in [('Analyses', 'Historical runs'), ('Candidates', 'Discovered IPs'),
+                            ('EASM assets', 'Defensible attribution'), ('Organizations', 'Parent entities')]:
+            tile, value = metric(title, '0', note)
+            metrics.addWidget(tile); self.dashboard_numbers.append(value)
+        outer.addLayout(metrics)
+        self.dashboard_summary = label(''); self.dashboard_summary.hide(); outer.addWidget(self.dashboard_summary)
+        outer.addWidget(label('Recent analyses', 'sectionTitle'))
+        recent_panel = card('panel'); recent_layout = QVBoxLayout(recent_panel)
+        recent_layout.setContentsMargins(12, 12, 12, 12)
+        self.recent = table(['Run', 'Started', 'Status', 'Candidates']); recent_layout.addWidget(self.recent)
+        outer.addWidget(recent_panel, 1)
         self.recent.cellDoubleClicked.connect(lambda r,_: self._open_selected_run(self.recent, r))
         return page
 
     def _new_analysis(self):
         page, outer = self._page('New analysis')
-        outer.addWidget(label('Enter targets manually or import an Excel workbook. Both use the same validation.'))
+        outer.addWidget(label('Define the organizations and domains you are authorized to assess.', 'muted'))
+        outer.addWidget(label('01  /  Target information', 'sectionTitle'))
+        form_panel = card('panel')
         form = QFormLayout()
+        form.setContentsMargins(22, 20, 22, 20)
+        form.setHorizontalSpacing(24); form.setVerticalSpacing(13)
         self.parent_name = QLineEdit(); self.entity = QLineEdit(); self.domain = QLineEdit()
         self.asns = QLineEdit(); self.registrants = QLineEdit()
         for title, widget in [('Parent organization', self.parent_name), ('Target entity', self.entity),
                               ('Target domain(s), ; separated', self.domain), ('Known ASN(s), ; separated', self.asns),
                               ('Registrant names, ; separated', self.registrants)]: form.addRow(title, widget)
-        outer.addLayout(form)
+        form_panel.setLayout(form); outer.addWidget(form_panel)
         actions = QHBoxLayout()
         actions.addWidget(button('Add target', self.add_manual, True))
         actions.addWidget(button('Import Excel', self.import_excel))
         actions.addWidget(button('Download template', self.template))
         actions.addStretch(); outer.addLayout(actions)
-        outer.addWidget(label('Review targets', 'heading'))
+        outer.addWidget(label('02  /  Review targets', 'sectionTitle'))
         self.preview = table(['Parent organization', 'Target entity', 'Domain', 'Known ASNs', 'Registrant names'])
         self.preview.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         outer.addWidget(self.preview,1)
@@ -246,10 +316,18 @@ class MainWindow(QMainWindow):
     def _results(self):
         page, outer = self._page('Results')
         self.run_heading = label('Open an analysis from Dashboard or History.', 'muted'); outer.addWidget(self.run_heading)
+        overview = QHBoxLayout(); overview.setSpacing(14)
+        self.result_numbers = []
+        for title, note in [('Candidates', 'Observed IPs'), ('EASM assets', 'Included'),
+                            ('Shared', 'Infrastructure context'), ('Rejected', 'Needs more evidence')]:
+            tile, value = metric(title, '0', note)
+            overview.addWidget(tile); self.result_numbers.append(value)
+        outer.addLayout(overview)
         controls = QHBoxLayout()
         self.search = QLineEdit(); self.search.setPlaceholderText('Search IP, organization, ASN, hostname…')
         self.search.textChanged.connect(self.filter_results); controls.addWidget(self.search,1)
-        self.org_filter = QComboBox(); self.org_filter.currentIndexChanged.connect(self.filter_results)
+        self.org_filter = QComboBox(); self.org_filter.addItem('All organizations')
+        self.org_filter.currentIndexChanged.connect(self.filter_results)
         controls.addWidget(self.org_filter)
         controls.addWidget(button('Export', self.export_current)); outer.addLayout(controls)
         controls.addWidget(button('Reverify selected IP', self.reverify_selected))
@@ -293,6 +371,9 @@ class MainWindow(QMainWindow):
                         r['finding'].get('confidence'), r['status']] for r in group])
             self.tabs.setTabText(list(self.result_tables).index(title), f'{title} ({len(group)})')
         self.result_count.setText(f'{len(rows)} matching candidates · {len(groups["EASM Assets"])} defensible assets')
+        for value, count in zip(self.result_numbers, (len(rows), len(groups['EASM Assets']),
+                                                len(groups['Shared Infrastructure']), len(groups['Rejected']))):
+            value.setText(str(count))
 
     def open_detail(self, widget, visual_row):
         item = widget.item(visual_row, 0)
@@ -340,9 +421,12 @@ class MainWindow(QMainWindow):
 
     def _organizations(self):
         page, outer = self._page('Organizations')
-        outer.addWidget(label('Select an organization to inspect its latest analysis.'))
+        outer.addWidget(label('Explore the parent organizations behind your saved analyses.', 'muted'))
+        outer.addWidget(label('Organization overview', 'sectionTitle'))
+        panel = card('panel'); contents = QVBoxLayout(panel)
+        contents.setContentsMargins(12, 12, 12, 12)
         self.organizations_table = table(['Organization', 'Runs', 'Candidates', 'EASM Assets'])
-        outer.addWidget(self.organizations_table)
+        contents.addWidget(self.organizations_table); outer.addWidget(panel, 1)
         self.organizations_table.cellDoubleClicked.connect(self.open_organization)
         return page
 
@@ -356,12 +440,17 @@ class MainWindow(QMainWindow):
 
     def _history(self):
         page, outer = self._page('Analysis history')
+        outer.addWidget(label('Reopen, retry or compare previous observations.', 'muted'))
+        actions = QHBoxLayout()
+        actions.addWidget(button('Retry selected', self.retry_selected, True))
+        actions.addWidget(button('Compare two selected runs', self.compare_runs))
+        actions.addStretch(); outer.addLayout(actions)
+        panel = card('panel'); contents = QVBoxLayout(panel)
+        contents.setContentsMargins(12, 12, 12, 12)
         self.history_table = table(['Run', 'Started', 'Completed', 'Status', 'Candidates'])
         self.history_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        outer.addWidget(self.history_table)
+        contents.addWidget(self.history_table); outer.addWidget(panel, 1)
         self.history_table.cellDoubleClicked.connect(lambda r,_: self._open_selected_run(self.history_table, r))
-        outer.addWidget(button('Retry selected', self.retry_selected))
-        outer.addWidget(button('Compare two selected runs', self.compare_runs))
         return page
 
     def _open_selected_run(self, widget, visual_row):
@@ -403,25 +492,35 @@ class MainWindow(QMainWindow):
 
     def _settings(self):
         page, outer = self._page('Settings')
+        outer.addWidget(label('Tune the workspace and connect optional evidence providers.', 'muted'))
+        outer.addWidget(label('Appearance & performance', 'sectionTitle'))
+        performance = card('panel')
         form = QFormLayout()
+        form.setContentsMargins(22, 20, 22, 20); form.setVerticalSpacing(14)
         self.theme_box = QComboBox(); self.theme_box.addItems(['Light','Dark'])
         self.theme_box.currentTextChanged.connect(self.apply_theme)
         self.workers_spin = QSpinBox(); self.workers_spin.setRange(1,32); self.workers_spin.setValue(4)
         self.timeout_spin = QSpinBox(); self.timeout_spin.setRange(3,120); self.timeout_spin.setValue(15)
         form.addRow('Appearance', self.theme_box)
         form.addRow('Workers', self.workers_spin); form.addRow('HTTP timeout (seconds)', self.timeout_spin)
-        outer.addLayout(form)
-        outer.addWidget(label(f'Local database: {self.store.path}'))
-        outer.addWidget(label('Optional provider credentials are stored in a local .env beside the database. Existing values are never displayed. Leave a field blank to keep its value.'))
+        performance.setLayout(form); outer.addWidget(performance)
+        outer.addWidget(label('Evidence providers', 'sectionTitle'))
+        provider_panel = card('panel'); provider_layout = QVBoxLayout(provider_panel)
+        provider_layout.setContentsMargins(22, 20, 22, 20); provider_layout.setSpacing(14)
+        provider_layout.addWidget(label('Shodan checks candidates by exact IP and can discover more through hostname search. Censys adds historical DNS context when configured. These sources do not alone prove ownership.', 'muted'))
         credentials = QFormLayout()
+        credentials.setVerticalSpacing(12)
         self.credential_inputs = {}
         for name in ('SHODAN_API_KEY','CENSYS_API_TOKEN','CENSYS_ORG_ID'):
             entry = QLineEdit(); entry.setEchoMode(QLineEdit.Password)
             entry.setPlaceholderText('Configured' if credential_presence()[name] else 'Not configured')
             self.credential_inputs[name] = entry
             credentials.addRow(name, entry)
-        outer.addLayout(credentials)
-        outer.addWidget(button('Save provider credentials', self.save_provider_credentials))
+        provider_layout.addLayout(credentials)
+        provider_layout.addWidget(button('Save provider credentials', self.save_provider_credentials, True))
+        outer.addWidget(provider_panel)
+        outer.addWidget(label(f'Local database  ·  {self.store.path}', 'muted'))
+        outer.addWidget(label('Credentials are saved in a local .env beside the database. Existing values stay masked; blank fields keep their values.', 'muted'))
         outer.addStretch()
         return page
 
@@ -453,6 +552,8 @@ class MainWindow(QMainWindow):
             record = orgs.setdefault(row['organization'], {'runs':set(),'candidates':0,'assets':0})
             record['runs'].add(row['run_id']); record['candidates']+=1; record['assets']+=bool(row['included'])
         fill(self.organizations_table, [[name,len(v['runs']),v['candidates'],v['assets']] for name,v in sorted(orgs.items())])
+        for value, count in zip(self.dashboard_numbers, (len(runs), len(all_rows), included, len(orgs))):
+            value.setText(str(count))
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

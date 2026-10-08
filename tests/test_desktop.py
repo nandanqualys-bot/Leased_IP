@@ -183,3 +183,109 @@ def test_public_cache_reuses_get_without_storing_provider_keys(tmp_path):
     client.get('https://api.shodan.io/shodan/host/1.1.1.1',params={'key':'secret'})
     assert client.calls==2
     assert b'secret' not in (tmp_path/'cache.db').read_bytes()
+
+
+def test_shodan_hostname_search_adds_only_in_scope_public_ipv4(monkeypatch):
+    d=engine.discovery
+    class Response:
+        ok=True
+        def json(self):
+            return {'matches':[
+                {'ip_str':'1.1.1.1','hostnames':['app.example.com']},
+                {'ip_str':'8.8.8.8','hostnames':['unrelated.org']},
+                {'ip_str':'10.0.0.1','hostnames':['app.example.com']},
+                {'ip_str':'2606:4700::1111','hostnames':['app.example.com']},
+            ]}
+    class Client:
+        def get(self,url,**kwargs):
+            assert url=='https://api.shodan.io/shodan/host/search'
+            assert kwargs['params']['query']=='hostname:"example.com"'
+            return Response()
+    assert d.shodan_domain_candidates(Client(),'test-key','example.com') == [('1.1.1.1',['app.example.com'])]
+    assert d.shodan_domain_candidates(Client(),'','example.com') == []
+
+
+def test_new_candidate_sources_keep_known_asn_filter(monkeypatch):
+    d=engine.discovery
+    monkeypatch.setattr(d,'crtsh',lambda *a: [])
+    monkeypatch.setattr(d,'official_site_discovery',lambda *a: ([],[]))
+    monkeypatch.setattr(d,'dns_cnames',lambda *a: [])
+    monkeypatch.setattr(d,'dns_resolve',lambda *a: [])
+    monkeypatch.setattr(d,'shodan_domain_candidates',lambda *a: [('1.1.1.1',['app.example.com'])])
+    monkeypatch.setattr(d,'ripestat_network_info',lambda client,ip: {'asns':[27385 if ip=='1.1.1.1' else 13335]})
+    monkeypatch.setattr(d,'ripestat_as_overview',lambda *a: {'holder':'Provider'})
+    target={'parent_organization':'Example','target_entity':'Example','target_domains':['example.com'],
+            'known_asns':['AS27385'],'known_registrant_names':[]}
+    rows=d.process_target(target,object(),None,{'shodan_api_key':'test-key'},
+                          history_lookup=lambda domain:['8.8.8.8'])
+    assert {r['IP'] for r in rows}=={'8.8.8.8'}
+    assert rows[0]['Discovery_Source']=='Historical DNS (context)'
+    assert d.process_target(target,object(),None,{},include_known=True,
+                            history_lookup=lambda domain:['8.8.8.8'])[0]['In_Known_ASN']
+
+
+def test_shodan_host_lookup_uses_exact_ip():
+    v=engine.verification
+    class Response:
+        ok=True
+        def json(self): return {'hostnames':['app.example.com']}
+    class Client:
+        def get(self,url,**kwargs):
+            assert url=='https://api.shodan.io/shodan/host/1.1.1.1'
+            assert kwargs['params']['key']=='test-key'
+            return Response()
+    assert v.shodan(Client(),'test-key','1.1.1.1')['hostnames']==['app.example.com']
+
+
+def test_cloud_rdap_does_not_cancel_live_dns_and_tls(monkeypatch):
+    v=engine.verification
+    monkeypatch.setattr(v,'rdap',lambda *a: {'name':'Unrelated Cloud Provider'})
+    monkeypatch.setattr(v,'rdap_org',lambda data: data['name'])
+    monkeypatch.setattr(v,'ripe_network',lambda *a: {'asns':[13335]})
+    monkeypatch.setattr(v,'ripe_as',lambda *a: {'holder':'Provider'})
+    monkeypatch.setattr(v,'ptr',lambda *a: '')
+    monkeypatch.setattr(v,'resolve',lambda *a: ['1.1.1.1'])
+    monkeypatch.setattr(v,'tls',lambda *a: {'cn':'app.example.com','sans':['app.example.com']})
+    monkeypatch.setattr(v,'crt_assoc',lambda *a: [])
+    monkeypatch.setattr(v,'shodan',lambda *a: {})
+    target={'parent_organization':'Example','target_entity':'Example','target_domains':['example.com'],
+            'known_asns':['AS64500'],'known_registrant_names':[]}
+    candidate={'ip':'1.1.1.1','hostname':'app.example.com','origin_asn':'AS13335'}
+    result=v.score_candidate(target,candidate,object(),{})
+    assert result['score']==50
+    assert not any(x[1].startswith('Negative:') for x in result['evidence'])
+
+
+def test_censys_history_is_wired_into_desktop_discovery(monkeypatch):
+    target={'parent_organization':'Example','target_entity':'Example','target_domains':['example.com'],
+            'known_asns':['AS64500'],'known_registrant_names':[]}
+    monkeypatch.setattr(engine.verification,'censys_enabled',lambda cfg: True)
+    monkeypatch.setattr(engine.verification,'censys_domain_history',lambda client,cfg,domain,days: ['1.1.1.1'])
+    observed=[]
+    def discover(t,client,cache,cfg,**kwargs):
+        observed.extend(kwargs['history_lookup']('example.com'))
+        return []
+    monkeypatch.setattr(engine.discovery,'process_target',discover)
+    assert engine.analyze([target],cfg={'censys_history_days':31})==[]
+    assert observed==['1.1.1.1']
+
+
+def test_origin_changing_to_known_asn_during_verification_still_excludes(monkeypatch):
+    targets=engine.normalize_targets([dict(zip(engine.input_engine.COLUMNS,
+        ['Example','Example','example.com','AS27385','']))])
+    row={'IP':'1.1.1.1','Origin_ASN':'AS13335','Discovered_Hostname':'app.example.com',
+         'Origin_Organization':'Provider','Hosting_Provider':'Provider',
+         'Discovery_Source':'DNS','Discovery_Evidence':'{}','First_Seen':'','Last_Seen':''}
+    monkeypatch.setattr(engine.discovery,'process_target',lambda *a,**k:[row])
+    monkeypatch.setattr(engine.verification,'score_candidate',lambda *a:{
+        'origin_asn':'AS27385','confidence':'HIGH','relationship':'Owned','score':90,
+        'evidence':[('DNS','Observed',25)],'proof':'Old proof'})
+    result=engine.analyze(targets)[0]
+    assert result['status']=='KNOWN_ASN_EXCLUDED'
+    assert not result['included']
+
+
+def test_local_config_key_is_used_when_environment_key_missing(monkeypatch):
+    monkeypatch.delenv('SHODAN_API_KEY', raising=False)
+    monkeypatch.setattr(engine.discovery, 'cfg_load', lambda path: {'shodan_api_key':'local-test-key'})
+    assert engine.config()['shodan_api_key']=='local-test-key'

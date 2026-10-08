@@ -228,7 +228,7 @@ def crtsh(client, domain):
         for row in rows:
             for n in str(row.get("name_value","")).splitlines():
                 n=n.strip().lower().lstrip("*.")
-                if n.endswith(domain):
+                if host_in_scope(n, domain):
                     names.add(n)
         return sorted(names)
     except Exception as e:
@@ -241,9 +241,36 @@ def shodan_host(client, api_key, ip):
         r=client.get(f"https://api.shodan.io/shodan/host/{ip}",params={"key":api_key},timeout=15)
         if r.ok:
             return r.json()
-    except Exception as e:
-        logging.warning("Shodan failed %s: %s",ip,e)
+    except Exception:
+        logging.warning("Shodan host lookup failed for %s", ip)
     return {}
+
+def shodan_domain_candidates(client, api_key, domain):
+    """Bounded Shodan hostname search; observations are candidates, not proof."""
+    if not api_key:
+        return []
+    try:
+        response = client.get(
+            "https://api.shodan.io/shodan/host/search",
+            params={"key": api_key, "query": f'hostname:"{domain}"', "page": 1},
+            timeout=20,
+        )
+        if not response.ok:
+            return []
+        found = []
+        for match in response.json().get("matches", [])[:100]:
+            ip = match.get("ip_str", "")
+            names = [name.lower().rstrip(".") for name in match.get("hostnames", [])
+                     if isinstance(name, str) and host_in_scope(name, domain)]
+            try:
+                if names and ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global:
+                    found.append((ip, sorted(set(names))))
+            except ValueError:
+                continue
+        return found
+    except Exception:
+        logging.warning("Shodan domain search failed for %s", domain)
+        return []
 
 def official_site_discovery(client, domain):
     """Lightweight, same-domain public-page inspection; no search-engine scraping."""
@@ -272,7 +299,7 @@ def host_in_scope(host, domain):
     d=domain.lower().rstrip(".")
     return host==d or host.endswith("."+d)
 
-def process_target(target, client, cache, cfg, include_known=False):
+def process_target(target, client, cache, cfg, include_known=False, history_lookup=None):
     parent=target["parent_organization"]; entity=target["target_entity"]
     known_asns={x.upper() for x in target.get("known_asns",[])}
     candidates={}
@@ -280,8 +307,22 @@ def process_target(target, client, cache, cfg, include_known=False):
     domains=[norm_domain(x) for x in target.get("target_domains",[])]
 
     discovered_hosts=set(domains)
+    ct_hosts=set()
     for d in domains:
-        discovered_hosts.update(crtsh(client,d))
+        names = crtsh(client,d)
+        ct_hosts.update(names)
+        discovered_hosts.update(names)
+        for ip, names in shodan_domain_candidates(client, os.getenv("SHODAN_API_KEY") or cfg.get("shodan_api_key", ""), d):
+            meta = candidates.setdefault(ip,{})
+            meta.setdefault("shodan_names",set()).update(names)
+            discovered_hosts.update(names)
+        if history_lookup:
+            for ip in history_lookup(d)[:100]:
+                try:
+                    if ipaddress.ip_address(ip).version == 4 and ipaddress.ip_address(ip).is_global:
+                        candidates.setdefault(ip,{}).setdefault("historical_domains",set()).add(d)
+                except ValueError:
+                    continue
         official_ips, _ = official_site_discovery(client,d)
         for item in official_ips:
             try:
@@ -308,7 +349,7 @@ def process_target(target, client, cache, cfg, include_known=False):
         try:
             ip_obj=ipaddress.ip_address(ip)
         except ValueError: continue
-        if ip_obj.version != 4:
+        if ip_obj.version != 4 or not ip_obj.is_global:
             continue
         ni=ripestat_network_info(client,ip)
         asns=ni.get("asns") or []
@@ -323,7 +364,7 @@ def process_target(target, client, cache, cfg, include_known=False):
         sh={}
         tls={}
         sans=[]
-        ct_names=sorted({h for d in domains for h in discovered_hosts if host_in_scope(h,d)})
+        ct_names=sorted(ct_hosts & (meta.get("hostnames",set()) | meta.get("shodan_names",set())))
         first=last=datetime.now(timezone.utc).isoformat()
         sh_hostnames=[]
         sh_domains=[]
@@ -332,6 +373,8 @@ def process_target(target, client, cache, cfg, include_known=False):
         if meta.get("dns_records"): evidence.append("DNS")
         if ct_names: evidence.append("CT (context)")
         if meta.get("official_evidence"): evidence.append("Official/Public Domain")
+        if meta.get("shodan_names"): evidence.append("Shodan (context)")
+        if meta.get("historical_domains"): evidence.append("Historical DNS (context)")
         if origin_asn not in asn_org_cache:
             asn_org_cache[origin_asn]=ripestat_as_overview(client,origin_asn).get("holder","") if origin_asn else ""
         origin_org=asn_org_cache.get(origin_asn,"")
@@ -343,7 +386,7 @@ def process_target(target, client, cache, cfg, include_known=False):
             "Registered_Organization":rd_org or "Not Available",
             "Hosting_Provider":sh.get("isp") or sh.get("org") or "Not Available",
             "Reverse_DNS":ptrname or "Not Available",
-            "Discovered_Hostname":";".join(sorted(meta.get("hostnames",set()))),
+            "Discovered_Hostname":";".join(sorted(meta.get("hostnames",set()) | meta.get("shodan_names",set()))),
             "Discovery_Source":";".join(evidence) or "DNS",
             "TLS_CN":tls.get("cn","Not Available"),"TLS_SANs":";".join(sans) if sans else "Not Available",
             "CT_Domains":";".join(ct_names) if ct_names else "Not Available",
@@ -355,7 +398,9 @@ def process_target(target, client, cache, cfg, include_known=False):
             "Discovery_Evidence":json.dumps({
                 "dns":meta.get("dns_records",[]),"tls":tls,
                 "rdap_org":rd_org,"origin_asn":origin_asn,
-                "shodan_org":sh.get("org"),"official":meta.get("official_values",[])
+                "shodan_org":sh.get("org"),"official":meta.get("official_values",[]),
+                "shodan_names":sorted(meta.get("shodan_names",set())),
+                "historical_domains":sorted(meta.get("historical_domains",set()))
             },default=str)
         })
     return rows

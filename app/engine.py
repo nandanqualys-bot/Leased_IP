@@ -54,12 +54,7 @@ def slug(value: str) -> str:
 
 
 def config():
-    cfg = discovery.cfg_load(ROOT / 'config.json')
-    # Credentials are supplied by the existing optional environment providers.
-    cfg.pop('shodan_api_key', None)
-    cfg.pop('censys_api_token', None)
-    cfg.pop('censys_org_id', None)
-    return cfg
+    return discovery.cfg_load(ROOT / 'config.json')
 
 
 def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, cfg=None) -> list[dict]:
@@ -75,7 +70,12 @@ def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, 
         if cancelled():
             break
         emit('discovery', index, len(targets), target['parent_organization'])
-        rows = discovery.process_target(target, client_d, None, cfg, include_known=True)
+        history_lookup = None
+        if verification.censys_enabled(cfg):
+            history_lookup = lambda domain: verification.censys_domain_history(
+                client_d, cfg, domain, int(cfg.get('censys_history_days', 31)))
+        rows = discovery.process_target(target, client_d, None, cfg,
+                                        include_known=True, history_lookup=history_lookup)
         # The legacy engine filters by canonical ASNs. Defend the boundary again.
         known = {canonical_asn(x) for x in target.get('known_asns', []) if x}
         for row in rows:
@@ -110,7 +110,18 @@ def analyze(targets: list[dict], emit=lambda *a: None, cancelled=lambda: False, 
             emit('verification', index, len(targets), ip)
             try:
                 finding = verification.score_candidate(target, candidate, client_v, cfg)
-                status = classify(finding)
+                observed = finding.get('origin_asn', '')
+                current_origin = canonical_asn(observed) if observed and observed != 'Not Available' else ''
+                if current_origin in known:
+                    status = 'KNOWN_ASN_EXCLUDED'
+                    finding = {
+                        'relationship': 'Known target ASN', 'confidence': 'EXCLUDED',
+                        'origin_asn': current_origin,
+                        'proof': f'{ip} is now originated by {current_origin}, a known target ASN. Excluded from EASM.',
+                        'evidence': [('Known ASN', f'Current origin {current_origin} matches target ASN', 0)],
+                    }
+                else:
+                    status = classify(finding)
                 result = {
                     'organization': target['parent_organization'],
                     'entity': target['target_entity'], 'domains': target['target_domains'],
